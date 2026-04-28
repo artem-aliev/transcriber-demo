@@ -20,9 +20,10 @@ import logging
 import sys
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from typing import TYPE_CHECKING, Any, Dict, Optional
 
-import numpy as np
+if TYPE_CHECKING:
+    import numpy as np
 
 # ── Structured logger ────────────────────────────────────────────────────────
 logger = logging.getLogger("transcriber")
