@@ -1,0 +1,483 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Transcriber — Live ASR</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Oxygen,
+                 Ubuntu, Cantarell, sans-serif;
+    background: #1a1a2e;
+    color: #e0e0e0;
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 2rem 1rem;
+  }
+  h1 {
+    font-size: 1.5rem;
+    font-weight: 600;
+    color: #ffffff;
+    margin-bottom: 0.25rem;
+  }
+  .subtitle {
+    font-size: 0.85rem;
+    color: #8888aa;
+    margin-bottom: 1.5rem;
+  }
+
+  /* Controls */
+  .controls {
+    display: flex;
+    gap: 0.75rem;
+    margin-bottom: 0.75rem;
+    flex-wrap: wrap;
+    justify-content: center;
+  }
+  button {
+    padding: 0.6rem 1.5rem;
+    border: none;
+    border-radius: 6px;
+    font-size: 0.95rem;
+    font-weight: 500;
+    cursor: pointer;
+    transition: background 0.15s ease, opacity 0.15s ease;
+  }
+  button:disabled {
+    opacity: 0.45;
+    cursor: not-allowed;
+  }
+  .btn-start {
+    background: #0d9488;
+    color: #fff;
+  }
+  .btn-start:hover:not(:disabled) { background: #0f766e; }
+  .btn-stop {
+    background: #dc2626;
+    color: #fff;
+  }
+  .btn-stop:hover:not(:disabled) { background: #b91c1c; }
+
+  /* Connection status */
+  .status {
+    font-size: 0.85rem;
+    padding: 0.35rem 0.9rem;
+    border-radius: 4px;
+    margin-bottom: 1rem;
+    text-align: center;
+    min-width: 140px;
+  }
+  .status-connecting { background: #ca8a04; color: #1a1a2e; }
+  .status-connected  { background: #166534; color: #bbf7d0; }
+  .status-disconnected { background: #4a4a6a; color: #aaaacc; }
+  .status-error       { background: #7f1d1d; color: #fecaca; }
+
+  /* Transcript */
+  .transcript-box {
+    width: 100%;
+    max-width: 720px;
+    background: #16213e;
+    border: 1px solid #2a2a4a;
+    border-radius: 8px;
+    padding: 1rem 1.25rem;
+    min-height: 180px;
+    max-height: 60vh;
+    overflow-y: auto;
+    font-size: 1.05rem;
+    line-height: 1.65;
+    white-space: pre-wrap;
+    word-wrap: break-word;
+    color: #d4d4e8;
+  }
+  .transcript-box:empty::before {
+    content: "Transcript will appear here…";
+    color: #5555 77;
+  }
+
+  /* Error banner */
+  .error-banner {
+    width: 100%;
+    max-width: 720px;
+    background: #7f1d1d;
+    color: #fecaca;
+    border: 1px solid #991b1b;
+    border-radius: 6px;
+    padding: 0.6rem 1rem;
+    margin-top: 0.75rem;
+    font-size: 0.875rem;
+    display: none;
+  }
+  .error-banner.visible { display: block; }
+
+  /* Spinner */
+  .spinner {
+    display: inline-block;
+    width: 14px;
+    height: 14px;
+    border: 2px solid transparent;
+    border-top-color: currentColor;
+    border-radius: 50%;
+    animation: spin 0.7s linear infinite;
+    vertical-align: middle;
+    margin-right: 0.35rem;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+</style>
+</head>
+<body>
+
+<h1>Transcriber</h1>
+<div class="subtitle">Live Speech-to-Text — English</div>
+
+<div class="controls">
+  <button id="btnStart" class="btn-start">&#9654; Start</button>
+  <button id="btnStop" class="btn-stop" disabled>&#9632; Stop</button>
+</div>
+
+<div id="status" class="status status-disconnected">Disconnected</div>
+<div id="transcript" class="transcript-box"></div>
+<div id="errorBanner" class="error-banner"></div>
+
+<script>
+(function () {
+  "use strict";
+
+  // ── DOM refs ───────────────────────────────────────────────────────────
+  const btnStart  = document.getElementById("btnStart");
+  const btnStop   = document.getElementById("btnStop");
+  const statusEl  = document.getElementById("status");
+  const transcriptEl = document.getElementById("transcript");
+  const errorBanner = document.getElementById("errorBanner");
+
+  // ── State ──────────────────────────────────────────────────────────────
+  let audioCtx      = null;
+  let scriptNode    = null;
+  let micStream     = null;
+  let sourceNode    = null;
+  let ws            = null;
+
+  /** Accumulated resampled float32 samples waiting to be sent. */
+  let sampleBuffer  = [];
+  /** How many 16 kHz samples per chunk (≈500 ms). */
+  const SAMPLES_PER_CHUNK = 8000;
+  /** Native mic sample rate (filled when AudioContext is created). */
+  let nativeSampleRate  = 0;
+  /** Target sample rate for the ASR model. */
+  const TARGET_SR = 16000;
+
+  let streamingActive = false;
+
+  // ── UI helpers ─────────────────────────────────────────────────────────
+  function setStatus(state, text) {
+    statusEl.textContent = text;
+    statusEl.className = "status status-" + state;
+  }
+
+  function showError(msg) {
+    errorBanner.textContent = msg;
+    errorBanner.classList.add("visible");
+    console.error("[transcriber] " + msg);
+  }
+
+  function clearError() {
+    errorBanner.textContent = "";
+    errorBanner.classList.remove("visible");
+  }
+
+  function disableStart(disabled) {
+    btnStart.disabled = disabled;
+  }
+
+  function disableStop(disabled) {
+    btnStop.disabled = disabled;
+  }
+
+  function appendTranscript(text) {
+    transcriptEl.textContent = text;
+    // Auto-scroll to bottom
+    transcriptEl.scrollTop = transcriptEl.scrollHeight;
+  }
+
+  // ── WebSocket client ───────────────────────────────────────────────────
+  function connectWebSocket() {
+    const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+    const host = window.location.hostname || "localhost";
+    const port = window.location.port || "8000";
+    const url = protocol + "//" + host + ":" + port + "/ws";
+
+    console.log("[transcriber] WebSocket connecting to", url);
+    setStatus("connecting", "Connecting…");
+
+    ws = new WebSocket(url);
+    ws.binaryType = "arraybuffer";
+
+    ws.onopen = function () {
+      console.log("[transcriber] WebSocket open — readyState=", ws.readyState);
+      setStatus("connected", "Connected");
+      clearError();
+    };
+
+    ws.onmessage = function (event) {
+      try {
+        const msg = JSON.parse(event.data);
+        if (msg.error) {
+          console.warn("[transcriber] Server error:", msg.error);
+          showError("Server: " + msg.error);
+          return;
+        }
+        if (msg.text != null) {
+          console.log(
+            "[transcriber] Transcript update (" +
+              msg.text.length + " chars, language=" + msg.language + ")"
+          );
+          appendTranscript(msg.text);
+        }
+      } catch (e) {
+        console.warn("[transcriber] Failed to parse server message:", e);
+      }
+    };
+
+    ws.onclose = function (event) {
+      console.log(
+        "[transcriber] WebSocket closed — code=" + event.code +
+        ", reason=" + (event.reason || "(none)") +
+        ", wasClean=" + event.wasClean
+      );
+      if (streamingActive) {
+        setStatus("disconnected", "Disconnected");
+        showError("Server disconnected unexpectedly. Click Start to reconnect.");
+      } else {
+        setStatus("disconnected", "Disconnected");
+      }
+      ws = null;
+    };
+
+    ws.onerror = function (err) {
+      console.error("[transcriber] WebSocket error:", err);
+      setStatus("error", "Connection Error");
+      showError("WebSocket connection failed. Is the server running on port " +
+                port + "?");
+    };
+
+    return ws;
+  }
+
+  // ── Resampling ─────────────────────────────────────────────────────────
+  /**
+   * Linear resample from native SR to TARGET_SR (16 kHz).
+   *
+   * For each output sample at index i, find the two nearest input samples
+   * and linearly interpolate.
+   *
+   * @param {Float32Array} input  - Audio samples at nativeSampleRate.
+   * @param {number} inRate       - Native sample rate (Hz).
+   * @param {number} outRate      - Target sample rate (Hz, default 16000).
+   * @returns {Float32Array} Resampled mono audio.
+   */
+  function resample(input, inRate, outRate) {
+    if (inRate === outRate) return new Float32Array(input);
+
+    const ratio = inRate / outRate;
+    const outLen = Math.floor(input.length / ratio);
+    const output = new Float32Array(outLen);
+
+    for (let i = 0; i < outLen; i++) {
+      const srcIdx = i * ratio;
+      const srcFloor = Math.floor(srcIdx);
+      const srcCeil  = Math.min(srcFloor + 1, input.length - 1);
+      const frac = srcIdx - srcFloor;
+      output[i] = input[srcFloor] * (1 - frac) + input[srcCeil] * frac;
+    }
+
+    return output;
+  }
+
+  // ── Audio pipeline ─────────────────────────────────────────────────────
+  /**
+   * onaudioprocess handler for ScriptProcessorNode.
+   *
+   * 1. Convert input to mono (channel 0).
+   * 2. Resample to 16 kHz.
+   * 3. Accumulate in sampleBuffer.
+   * 4. Every ~SAMPLES_PER_CHUNK samples, drain buffer → Float32Array →
+   *    webSocket.send(buffer).
+   */
+  function onAudioProcess(event) {
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+
+    const inputBuffer = event.inputBuffer;
+    const inputData = inputBuffer.getChannelData(0);  // Float32Array, native SR
+
+    // Resample to 16 kHz
+    const resampled = resample(inputData, nativeSampleRate, TARGET_SR);
+
+    // Accumulate
+    sampleBuffer.push(resampled);
+
+    // Count total samples accumulated
+    let totalSamples = 0;
+    for (let i = 0; i < sampleBuffer.length; i++) {
+      totalSamples += sampleBuffer[i].length;
+    }
+
+    // Drain when we have enough
+    if (totalSamples >= SAMPLES_PER_CHUNK) {
+      // Flatten all buffers into one Float32Array
+      const chunk = new Float32Array(totalSamples);
+      let offset = 0;
+      for (let i = 0; i < sampleBuffer.length; i++) {
+        chunk.set(sampleBuffer[i], offset);
+        offset += sampleBuffer[i].length;
+      }
+
+      // Send as binary WebSocket frame
+      try {
+        ws.send(chunk.buffer);
+        console.log(
+          "[transcriber] Sent audio chunk: " +
+          chunk.length + " samples (" +
+          (chunk.length / TARGET_SR).toFixed(2) + "s)"
+        );
+      } catch (e) {
+        console.error("[transcriber] WebSocket send failed:", e);
+        showError("Failed to send audio — connection may be closed.");
+      }
+
+      // Reset buffer
+      sampleBuffer = [];
+    }
+  }
+
+  // ── Start / Stop ───────────────────────────────────────────────────────
+  async function startCapture() {
+    clearError();
+
+    // 1. Get microphone
+    try {
+      micStream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          channelCount: 1,
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+        },
+      });
+      console.log("[transcriber] Microphone access granted.");
+    } catch (err) {
+      console.error("[transcriber] Microphone permission denied:", err);
+      let msg = "Microphone access denied. ";
+      if (err.name === "NotAllowedError") {
+        msg += "Please allow microphone access in your browser settings.";
+      } else if (err.name === "NotFoundError") {
+        msg += "No microphone found on this device.";
+      } else {
+        msg += err.message || "Unknown error.";
+      }
+      showError(msg);
+      return;
+    }
+
+    // 2. Create AudioContext (user-gesture context satisfies autoplay policy)
+    try {
+      audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      nativeSampleRate = audioCtx.sampleRate;
+      console.log(
+        "[transcriber] AudioContext created — sampleRate=" +
+        nativeSampleRate + " Hz, state=" + audioCtx.state
+      );
+    } catch (err) {
+      console.error("[transcriber] AudioContext creation failed:", err);
+      showError("Failed to create audio context. Your browser may not support Web Audio API.");
+      micStream.getTracks().forEach(t => t.stop());
+      return;
+    }
+
+    // 3. Connect mic → ScriptProcessorNode
+    sourceNode = audioCtx.createMediaStreamSource(micStream);
+    scriptNode = audioCtx.createScriptProcessor(4096, 1, 1);
+    // Zero-gain node keeps the audio graph alive without feedback
+    var zeroGain = audioCtx.createGain();
+    zeroGain.gain.value = 0;
+
+    scriptNode.onaudioprocess = onAudioProcess;
+    sourceNode.connect(scriptNode);
+    // Must connect to destination to keep ScriptProcessorNode alive
+    scriptNode.connect(zeroGain);
+    zeroGain.connect(audioCtx.destination);
+
+    console.log("[transcriber] Audio pipeline started — ScriptProcessorNode bufferSize=4096");
+
+    // 4. Connect WebSocket
+    connectWebSocket();
+
+    // 5. Update UI
+    streamingActive = true;
+    disableStart(true);
+    disableStop(false);
+    sampleBuffer = [];
+  }
+
+  function stopCapture() {
+    streamingActive = false;
+
+    // Close WebSocket (server will call finish_streaming)
+    if (ws) {
+      console.log("[transcriber] Closing WebSocket…");
+      ws.close(1000, "User stopped");
+      ws = null;
+    }
+
+    // Stop mic tracks
+    if (micStream) {
+      micStream.getTracks().forEach(function (t) {
+        t.stop();
+        console.log("[transcriber] Mic track stopped:", t.label || t.id);
+      });
+      micStream = null;
+    }
+
+    // Disconnect audio graph
+    if (scriptNode) {
+      scriptNode.disconnect();
+      scriptNode.onaudioprocess = null;
+      scriptNode = null;
+    }
+    if (sourceNode) {
+      sourceNode.disconnect();
+      sourceNode = null;
+    }
+
+    // Close AudioContext
+    if (audioCtx && audioCtx.state !== "closed") {
+      audioCtx.close().then(function () {
+        console.log("[transcriber] AudioContext closed.");
+      }).catch(function (err) {
+        console.warn("[transcriber] AudioContext close warning:", err);
+      });
+      audioCtx = null;
+    }
+
+    // Update UI
+    disableStart(false);
+    disableStop(true);
+    setStatus("disconnected", "Disconnected");
+    sampleBuffer = [];
+    console.log("[transcriber] Capture stopped — pipeline cleaned up.");
+  }
+
+  // ── Event listeners ────────────────────────────────────────────────────
+  btnStart.addEventListener("click", startCapture);
+  btnStop.addEventListener("click", stopCapture);
+
+  // ── Initial state ──────────────────────────────────────────────────────
+  setStatus("disconnected", "Disconnected");
+  disableStop(true);
+
+  console.log("[transcriber] Frontend loaded. Ready.");
+})();
+</script>
+</body>
+</html>
