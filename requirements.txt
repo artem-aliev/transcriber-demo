@@ -1,0 +1,26 @@
+# =============================================================================
+# IMPORTANT: Python ≤ 3.12 REQUIRED
+# PyTorch 2.x does not support Python 3.13+. You MUST use Python 3.10–3.12.
+# Use setup.sh to create a venv with the correct Python version automatically.
+# =============================================================================
+
+# ── Core ASR model ──
+# qwen-asr with vLLM backend — the vLLM extra pulls vLLM as a dependency.
+# We pin both qwen-asr and vLLM explicitly to avoid surprise upgrades.
+qwen-asr[vllm]==0.0.6
+vllm==0.14.0
+
+# ── PyTorch (required by qwen-asr / vLLM) ──
+# Pinned to <2.6.0 for compatibility with vLLM 0.14.0.
+torch>=2.0.0,<2.6.0
+
+# ── Web server (S02 / S03) ──
+fastapi>=0.110,<1.0
+uvicorn[standard]>=0.29,<1.0
+
+# ── Audio I/O (required by qwen-asr) ──
+soundfile>=0.12,<1.0
+librosa>=0.10,<1.0
+
+# ── NumPy (used directly in streaming pipeline) ──
+numpy>=1.24,<2.0
