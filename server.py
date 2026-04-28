@@ -22,16 +22,19 @@ Single-session constraint:
 
 from __future__ import annotations
 
+import io
 import logging
+import os
 import sys
 import time
 import traceback
 from contextlib import asynccontextmanager
-from typing import Any, Dict, Optional
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional
 
 import numpy as np
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, File, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi.responses import JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from starlette.responses import FileResponse
 
@@ -61,6 +64,17 @@ _model_available: bool = False
 _active_streaming: bool = False
 """Tracks whether a WebSocket streaming session is currently active.
 Only one session at a time (single LLM instance)."""
+
+_session_transcript: List[Dict[str, Any]] = []
+"""Accumulated transcript segments.  Each segment is a dict with at least
+``text`` (str) and ``time`` (float, wall-clock seconds since session start)."""
+
+_session_context: str = ""
+"""Domain-context text extracted from uploaded documents (R003)."""
+
+_session_start_time: Optional[float] = None
+"""Wall-clock timestamp (``time.time()``) when the current session began.
+``None`` when no session is active."""
 
 
 # ── Lifespan ────────────────────────────────────────────────────────────────
@@ -286,6 +300,225 @@ async def health() -> Dict[str, Any]:
         "model_available": _model_available,
         "active_streaming": _active_streaming,
     }
+
+
+# ── Document upload (R003) ──────────────────────────────────────────────────
+
+
+ALLOWED_EXTENSIONS = frozenset({".txt", ".docx", ".pptx"})
+
+
+@app.post("/upload")
+async def upload_document(file: UploadFile = File(...)) -> JSONResponse:
+    """Upload a document for domain-context hinting (R003).
+
+    Supported formats: ``.txt``, ``.docx``, ``.pptx``.
+
+    The extracted text is stored in ``_session_context`` and, if the
+    Transcriber is available, pushed via ``update_context()`` so that
+    subsequent transcription passes benefit from domain-term hints.
+    """
+    global _session_context, _transcriber
+
+    # ── Validate file extension ──────────────────────────────────────────
+    if not file.filename:
+        logger.warning("Upload rejected: no filename provided.")
+        return JSONResponse(
+            status_code=400,
+            content={"error": "No filename provided."},
+        )
+
+    ext = os.path.splitext(file.filename)[1].lower()
+    if ext not in ALLOWED_EXTENSIONS:
+        logger.warning(
+            "Upload rejected: unsupported extension '%s' (file=%s).",
+            ext,
+            file.filename,
+        )
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": (
+                    f"Unsupported file type: {ext}. "
+                    "Allowed: .txt, .docx, .pptx"
+                )
+            },
+        )
+
+    # ── Read file content ────────────────────────────────────────────────
+    try:
+        content = await file.read()
+    except Exception as exc:
+        logger.error("Failed to read uploaded file '%s': %s", file.filename, exc)
+        return JSONResponse(
+            status_code=400,
+            content={"error": f"Failed to read file: {exc}"},
+        )
+
+    if not content:
+        logger.warning("Upload rejected: empty file '%s'.", file.filename)
+        return JSONResponse(
+            status_code=400,
+            content={"error": "Uploaded file is empty."},
+        )
+
+    # ── Extract text by type ─────────────────────────────────────────────
+    try:
+        text = _extract_text(content, ext, file.filename)
+    except Exception as exc:
+        logger.error(
+            "Failed to parse file '%s': %s",
+            file.filename,
+            exc,
+            exc_info=True,
+        )
+        return JSONResponse(
+            status_code=400,
+            content={"error": f"Failed to parse file: {exc}"},
+        )
+
+    if not text.strip():
+        logger.warning(
+            "Uploaded file '%s' yielded no extractable text.", file.filename
+        )
+
+    # ── Store context ────────────────────────────────────────────────────
+    _session_context = text
+    if _transcriber is not None:
+        _transcriber.update_context(text)
+
+    logger.info(
+        "Document uploaded: %s (%d chars, %s). Context stored.",
+        file.filename,
+        len(text),
+        ext,
+    )
+
+    return JSONResponse(
+        status_code=200,
+        content={"status": "ok", "chars": len(text), "filename": file.filename},
+    )
+
+
+def _extract_text(content: bytes, ext: str, filename: str) -> str:
+    """Extract plain text from a document by extension.
+
+    Raises:
+        ImportError: If the required library is not installed.
+        ValueError: If the file content cannot be parsed.
+    """
+    if ext == ".txt":
+        return content.decode("utf-8")
+
+    elif ext == ".docx":
+        try:
+            from docx import Document  # type: ignore[import-untyped]
+        except ImportError:
+            raise ImportError(
+                "python-docx is not installed. Install with: "
+                "pip install python-docx>=1.0,<2.0"
+            )
+        doc = Document(io.BytesIO(content))
+        paragraphs = [p.text for p in doc.paragraphs if p.text.strip()]
+        return "\n".join(paragraphs)
+
+    elif ext == ".pptx":
+        try:
+            from pptx import Presentation  # type: ignore[import-untyped]
+        except ImportError:
+            raise ImportError(
+                "python-pptx is not installed. Install with: "
+                "pip install python-pptx>=0.6,<1.0"
+            )
+        prs = Presentation(io.BytesIO(content))
+        texts: List[str] = []
+        for slide in prs.slides:
+            for shape in slide.shapes:
+                if hasattr(shape, "text_frame") and shape.has_text_frame:
+                    slide_text = shape.text_frame.text.strip()
+                    if slide_text:
+                        texts.append(slide_text)
+        return "\n".join(texts)
+
+    # Should not reach here — caller validates extension.
+    raise ValueError(f"Unsupported file extension: {ext}")
+
+
+# ── Transcript export (R005) ────────────────────────────────────────────────
+
+
+@app.get("/export")
+async def export_transcript() -> Response:
+    """Export the accumulated transcript as timestamped markdown (R005).
+
+    Returns a downloadable ``.md`` file with an ISO-8601 date header,
+    language and context metadata, and timestamped segments in
+    ``[HH:MM:SS] text`` format.  Works with an empty transcript
+    (header-only output).
+    """
+    global _session_transcript, _transcriber
+
+    now = datetime.now(timezone.utc)
+
+    # ── Build markdown ───────────────────────────────────────────────────
+    lines: List[str] = []
+    lines.append("# Meeting Transcript")
+    lines.append("")
+    lines.append(f"**Date:** {now.strftime('%Y-%m-%dT%H:%M:%SZ')}")
+    lines.append("")
+
+    if _transcriber is not None:
+        lines.append(f"**Language:** {_transcriber.language}")
+        if _transcriber.context:
+            lines.append(f"**Context:** {_transcriber.context}")
+    else:
+        lines.append("**Language:** English")
+
+    lines.append("")
+
+    if _session_transcript:
+        lines.append("---")
+        lines.append("")
+
+        base_time: Optional[float] = _session_start_time
+
+        for segment in _session_transcript:
+            seg_text = segment.get("text", "")
+            seg_time = segment.get("time", 0.0)
+
+            # If we have a base time, use it; otherwise treat seg_time as
+            # already relative.
+            if base_time is not None:
+                elapsed = seg_time - base_time
+            else:
+                elapsed = seg_time
+
+            # Format as HH:MM:SS
+            hours = int(elapsed // 3600)
+            minutes = int((elapsed % 3600) // 60)
+            seconds = int(elapsed % 60)
+            timestamp = f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+            lines.append(f"[{timestamp}] {seg_text}")
+            lines.append("")
+
+    # ── Build filename ───────────────────────────────────────────────────
+    date_str = now.strftime("%Y-%m-%d")
+    filename = f"transcript-{date_str}.md"
+
+    md = "\n".join(lines)
+    logger.info(
+        "Export: %d segments, %d chars → %s.",
+        len(_session_transcript),
+        len(md),
+        filename,
+    )
+
+    return Response(
+        content=md,
+        media_type="text/markdown; charset=utf-8",
+        headers={"Content-Disposition": f"attachment; filename={filename}"},
+    )
 
 
 # ── Entrypoint ──────────────────────────────────────────────────────────────
