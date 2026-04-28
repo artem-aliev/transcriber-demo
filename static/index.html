@@ -9,8 +9,8 @@
   body {
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Oxygen,
                  Ubuntu, Cantarell, sans-serif;
-    background: #1a1a2e;
-    color: #e0e0e0;
+    background: #f5f3ee;
+    color: #2c2c2c;
     min-height: 100vh;
     display: flex;
     flex-direction: column;
@@ -20,12 +20,12 @@
   h1 {
     font-size: 1.5rem;
     font-weight: 600;
-    color: #ffffff;
+    color: #1a1a1a;
     margin-bottom: 0.25rem;
   }
   .subtitle {
     font-size: 0.85rem;
-    color: #8888aa;
+    color: #6b6b7b;
     margin-bottom: 1.5rem;
   }
 
@@ -40,46 +40,47 @@
   button {
     padding: 0.6rem 1.5rem;
     border: none;
-    border-radius: 6px;
+    border-radius: 4px;
     font-size: 0.95rem;
-    font-weight: 500;
+    font-weight: 400;
     cursor: pointer;
-    transition: background 0.15s ease, opacity 0.15s ease;
+    transition: background 0.15s ease, color 0.15s ease, opacity 0.15s ease;
+    background: transparent;
   }
   button:disabled {
     opacity: 0.45;
     cursor: not-allowed;
   }
   .btn-start {
-    background: #0d9488;
-    color: #fff;
+    border: 1.5px solid #2c2c2c;
+    color: #2c2c2c;
   }
-  .btn-start:hover:not(:disabled) { background: #0f766e; }
+  .btn-start:hover:not(:disabled) { background: #2c2c2c; color: #f5f3ee; }
   .btn-stop {
-    background: #dc2626;
-    color: #fff;
+    border: 1.5px solid #dc2626;
+    color: #dc2626;
   }
-  .btn-stop:hover:not(:disabled) { background: #b91c1c; }
+  .btn-stop:hover:not(:disabled) { background: #dc2626; color: #fff; }
   .btn-pause {
-    background: #ca8a04;
-    color: #fff;
+    border: 1.5px solid #ca8a04;
+    color: #ca8a04;
   }
-  .btn-pause:hover:not(:disabled) { background: #a36d04; }
+  .btn-pause:hover:not(:disabled) { background: #ca8a04; color: #fff; }
   .btn-resume {
-    background: #0d9488;
-    color: #fff;
+    border: 1.5px solid #0d9488;
+    color: #0d9488;
   }
-  .btn-resume:hover:not(:disabled) { background: #0f766e; }
+  .btn-resume:hover:not(:disabled) { background: #0d9488; color: #fff; }
   .btn-save {
-    background: #6366f1;
-    color: #fff;
+    border: 1.5px solid #6366f1;
+    color: #6366f1;
   }
-  .btn-save:hover:not(:disabled) { background: #4f46e5; }
+  .btn-save:hover:not(:disabled) { background: #6366f1; color: #fff; }
   .btn-upload {
-    background: #475569;
-    color: #fff;
+    border: 1.5px solid #6b7280;
+    color: #6b7280;
   }
-  .btn-upload:hover:not(:disabled) { background: #334155; }
+  .btn-upload:hover:not(:disabled) { background: #6b7280; color: #fff; }
 
   /* Connection status */
   .status {
@@ -90,42 +91,44 @@
     text-align: center;
     min-width: 140px;
   }
-  .status-connecting { background: #ca8a04; color: #1a1a2e; }
-  .status-connected  { background: #166534; color: #bbf7d0; }
-  .status-disconnected { background: #4a4a6a; color: #aaaacc; }
-  .status-error       { background: #7f1d1d; color: #fecaca; }
-  .status-paused      { background: #ca8a04; color: #1a1a2e; }
-  .status-stopped     { background: #4a4a6a; color: #aaaacc; }
+  .status-connecting { background: #e5e0d5; color: #6b5e3e; }
+  .status-connected  { background: #d4edda; color: #155724; }
+  .status-disconnected { background: #e8e4dc; color: #6b6b7b; }
+  .status-error       { background: #f8d7da; color: #721c24; }
+  .status-paused      { background: #fff3cd; color: #856404; }
+  .status-stopped     { background: #e8e4dc; color: #6b6b7b; }
 
   /* Transcript */
   .transcript-box {
     width: 100%;
-    max-width: 720px;
-    background: #16213e;
-    border: 1px solid #2a2a4a;
+    max-width: 780px;
+    background: #fefefc;
+    border: 1px solid #e8e4dc;
     border-radius: 8px;
-    padding: 1rem 1.25rem;
+    padding: 1.25rem 1.5rem;
     min-height: 180px;
     max-height: 60vh;
     overflow-y: auto;
-    font-size: 1.05rem;
-    line-height: 1.65;
+    font-family: Georgia, "Times New Roman", serif;
+    font-size: 1.1rem;
+    line-height: 1.8;
     white-space: pre-wrap;
     word-wrap: break-word;
-    color: #d4d4e8;
+    color: #2c2c2c;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.06);
   }
   .transcript-box:empty::before {
     content: "Transcript will appear here…";
-    color: #555577;
+    color: #b0a89c;
   }
 
   /* Error banner */
   .error-banner {
     width: 100%;
-    max-width: 720px;
-    background: #7f1d1d;
-    color: #fecaca;
-    border: 1px solid #991b1b;
+    max-width: 780px;
+    background: #f8d7da;
+    color: #721c24;
+    border: 1px solid #f5c6cb;
     border-radius: 6px;
     padding: 0.6rem 1rem;
     margin-top: 0.75rem;
