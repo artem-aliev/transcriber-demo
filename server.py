@@ -23,6 +23,7 @@ Single-session constraint:
 from __future__ import annotations
 
 import io
+import json
 import logging
 import os
 import sys
@@ -64,6 +65,14 @@ _model_available: bool = False
 _active_streaming: bool = False
 """Tracks whether a WebSocket streaming session is currently active.
 Only one session at a time (single LLM instance)."""
+
+_session_active: bool = False
+"""Whether a recording session is currently in progress.  Set ``True`` on
+first audio chunk, ``False`` on stop or disconnect."""
+
+_session_paused: bool = False
+"""Whether the session is paused.  While ``True``, audio frames are silently
+skipped to prevent ASR state corruption."""
 
 _session_transcript: List[Dict[str, Any]] = []
 """Accumulated transcript segments.  Each segment is a dict with at least
@@ -140,6 +149,7 @@ async def websocket_transcribe(ws: WebSocket) -> None:
         → disconnect → ``finish_streaming()``.
     """
     global _active_streaming, _transcriber, _model_available
+    global _session_active, _session_paused, _session_start_time
 
     client_host = ws.client.host if ws.client else "unknown"
     client_port = ws.client.port if ws.client else 0
@@ -188,7 +198,106 @@ async def websocket_transcribe(ws: WebSocket) -> None:
 
         # ── Receive loop ─────────────────────────────────────────────────
         while True:
-            data = await ws.receive_bytes()
+            data = await ws.receive()  
+
+            # ── Text frame: control protocol ────────────────────────────
+            if isinstance(data, str):
+                try:
+                    msg = json.loads(data)
+                except json.JSONDecodeError:
+                    logger.warning(
+                        "Invalid JSON in control message from %s:%d.",
+                        client_host,
+                        client_port,
+                    )
+                    await ws.send_json({"error": "Invalid JSON in control message"})
+                    continue
+
+                action = msg.get("action", "")
+
+                # ── "pause": finalise current segment, save transcript ─
+                if action == "pause":
+                    if state is not None and not _session_paused:
+                        result = _transcriber.finish_streaming(state)
+                        _session_transcript.append(
+                            {"text": result.text, "time": time.time()}
+                        )
+                        state = None
+                    _session_paused = True
+                    segment_text = (
+                        _session_transcript[-1]["text"] if _session_transcript else ""
+                    )
+                    await ws.send_json(
+                        {"status": "paused", "text": segment_text}
+                    )
+                    logger.info(
+                        "Pause: session paused — %d segments accumulated.",
+                        len(_session_transcript),
+                    )
+
+                # ── "resume": start a new ASR streaming segment ─────────
+                elif action == "resume":
+                    state = _transcriber.start_streaming(chunk_size_sec=2.0)
+                    initial_text = state.get("text", "")
+                    if initial_text:
+                        await ws.send_json(
+                            {"text": initial_text, "language": _transcriber.language}
+                        )
+                    _session_paused = False
+                    await ws.send_json({"status": "resumed"})
+                    logger.info("Resume: session resumed.")
+
+                # ── "stop": finalise and end session ─────────────────────
+                elif action == "stop":
+                    if state is not None:
+                        result = _transcriber.finish_streaming(state)
+                        _session_transcript.append(
+                            {"text": result.text, "time": time.time()}
+                        )
+                        state = None
+                    _session_active = False
+                    _session_paused = False
+                    await ws.send_json({"status": "stopped"})
+                    logger.info(
+                        "Stop: session stopped — %d segments accumulated.",
+                        len(_session_transcript),
+                    )
+                    break
+
+                # ── Unknown action ───────────────────────────────────────
+                else:
+                    await ws.send_json(
+                        {"error": f"Unknown action: {action}"}
+                    )
+                    logger.warning(
+                        "Unknown action '%s' from %s:%d.",
+                        action,
+                        client_host,
+                        client_port,
+                    )
+
+                continue
+
+            # ── Binary frame: audio processing ──────────────────────────
+            if not isinstance(data, bytes):
+                logger.warning(
+                    "Unexpected WebSocket frame type %s from %s:%d — ignoring.",
+                    type(data).__name__,
+                    client_host,
+                    client_port,
+                )
+                continue
+
+            # Pause guard: silently skip audio frames while paused
+            if _session_paused:
+                logger.debug("Audio frame skipped — session paused.")
+                continue
+
+            # First audio chunk — mark session active
+            if not _session_active:
+                _session_active = True
+                _session_start_time = time.time()
+                logger.info("Recording session active — first audio chunk received.")
 
             # Guard: skip zero-length frames
             if len(data) == 0:
@@ -264,6 +373,11 @@ async def websocket_transcribe(ws: WebSocket) -> None:
             try:
                 result = _transcriber.finish_streaming(state)
                 total_text_chars = len(result.text)
+                # Save final segment if session was active
+                if _session_active:
+                    _session_transcript.append(
+                        {"text": result.text, "time": time.time()}
+                    )
                 # Send final text if it differs from last partial
                 try:
                     await ws.send_json(
@@ -279,6 +393,8 @@ async def websocket_transcribe(ws: WebSocket) -> None:
                 )
 
         _active_streaming = False
+        _session_active = False
+        _session_paused = False
         logger.info(
             "Streaming session ended: %s:%d — %d chunks processed, "
             "final text: %d chars.",
@@ -299,6 +415,8 @@ async def health() -> Dict[str, Any]:
         "status": "ok",
         "model_available": _model_available,
         "active_streaming": _active_streaming,
+        "session_active": _session_active,
+        "session_paused": _session_paused,
     }
 
 
