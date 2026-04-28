@@ -60,6 +60,26 @@
     color: #fff;
   }
   .btn-stop:hover:not(:disabled) { background: #b91c1c; }
+  .btn-pause {
+    background: #ca8a04;
+    color: #fff;
+  }
+  .btn-pause:hover:not(:disabled) { background: #a36d04; }
+  .btn-resume {
+    background: #0d9488;
+    color: #fff;
+  }
+  .btn-resume:hover:not(:disabled) { background: #0f766e; }
+  .btn-save {
+    background: #6366f1;
+    color: #fff;
+  }
+  .btn-save:hover:not(:disabled) { background: #4f46e5; }
+  .btn-upload {
+    background: #475569;
+    color: #fff;
+  }
+  .btn-upload:hover:not(:disabled) { background: #334155; }
 
   /* Connection status */
   .status {
@@ -74,6 +94,8 @@
   .status-connected  { background: #166534; color: #bbf7d0; }
   .status-disconnected { background: #4a4a6a; color: #aaaacc; }
   .status-error       { background: #7f1d1d; color: #fecaca; }
+  .status-paused      { background: #ca8a04; color: #1a1a2e; }
+  .status-stopped     { background: #4a4a6a; color: #aaaacc; }
 
   /* Transcript */
   .transcript-box {
@@ -94,7 +116,7 @@
   }
   .transcript-box:empty::before {
     content: "Transcript will appear here…";
-    color: #5555 77;
+    color: #555577;
   }
 
   /* Error banner */
@@ -135,6 +157,11 @@
 <div class="controls">
   <button id="btnStart" class="btn-start">&#9654; Start</button>
   <button id="btnStop" class="btn-stop" disabled>&#9632; Stop</button>
+  <button id="btnPause" class="btn-pause" disabled>&#9208; Pause</button>
+  <button id="btnResume" class="btn-resume" disabled>&#9654; Resume</button>
+  <button id="btnSave" class="btn-save" disabled>&#128190; Save</button>
+  <input type="file" id="fileUpload" accept=".pptx,.docx,.txt" style="display:none">
+  <button id="btnUpload" class="btn-upload">&#128206; Upload Context</button>
 </div>
 
 <div id="status" class="status status-disconnected">Disconnected</div>
@@ -146,11 +173,16 @@
   "use strict";
 
   // ── DOM refs ───────────────────────────────────────────────────────────
-  const btnStart  = document.getElementById("btnStart");
-  const btnStop   = document.getElementById("btnStop");
-  const statusEl  = document.getElementById("status");
+  const btnStart   = document.getElementById("btnStart");
+  const btnStop    = document.getElementById("btnStop");
+  const btnPause   = document.getElementById("btnPause");
+  const btnResume  = document.getElementById("btnResume");
+  const btnSave    = document.getElementById("btnSave");
+  const btnUpload  = document.getElementById("btnUpload");
+  const fileUpload = document.getElementById("fileUpload");
+  const statusEl   = document.getElementById("status");
   const transcriptEl = document.getElementById("transcript");
-  const errorBanner = document.getElementById("errorBanner");
+  const errorBanner  = document.getElementById("errorBanner");
 
   // ── State ──────────────────────────────────────────────────────────────
   let audioCtx      = null;
@@ -169,6 +201,8 @@
   const TARGET_SR = 16000;
 
   let streamingActive = false;
+  /** Set when user explicitly stops — onclose should not show error. */
+  let stopRequested = false;
 
   // ── UI helpers ─────────────────────────────────────────────────────────
   function setStatus(state, text) {
@@ -193,6 +227,18 @@
 
   function disableStop(disabled) {
     btnStop.disabled = disabled;
+  }
+
+  function disablePause(disabled) {
+    btnPause.disabled = disabled;
+  }
+
+  function disableResume(disabled) {
+    btnResume.disabled = disabled;
+  }
+
+  function disableSave(disabled) {
+    btnSave.disabled = disabled;
   }
 
   function appendTranscript(text) {
@@ -223,11 +269,47 @@
     ws.onmessage = function (event) {
       try {
         const msg = JSON.parse(event.data);
+
+        // Error from server
         if (msg.error) {
           console.warn("[transcriber] Server error:", msg.error);
           showError("Server: " + msg.error);
           return;
         }
+
+        // Status messages from control protocol
+        if (msg.status === "paused") {
+          console.log("[transcriber] Session paused — " +
+            (msg.text ? msg.text.length : 0) + " chars accumulated");
+          setStatus("paused", "Paused");
+          disablePause(true);
+          disableResume(false);
+          if (msg.text != null) {
+            appendTranscript(msg.text);
+          }
+          return;
+        }
+
+        if (msg.status === "resumed") {
+          console.log("[transcriber] Session resumed");
+          setStatus("connected", "Connected");
+          disablePause(false);
+          disableResume(true);
+          return;
+        }
+
+        if (msg.status === "stopped") {
+          console.log("[transcriber] Session stopped by server");
+          setStatus("stopped", "Stopped");
+          disablePause(true);
+          disableResume(true);
+          disableStop(true);
+          disableSave(false);
+          disableStart(false);
+          return;
+        }
+
+        // Transcript update (ongoing streaming partial)
         if (msg.text != null) {
           console.log(
             "[transcriber] Transcript update (" +
@@ -246,7 +328,15 @@
         ", reason=" + (event.reason || "(none)") +
         ", wasClean=" + event.wasClean
       );
-      if (streamingActive) {
+      // Clean up audio pipeline regardless of how WS closed
+      cleanupAudioPipeline();
+
+      if (stopRequested) {
+        // User explicitly stopped — normal teardown
+        stopRequested = false;
+        setStatus("disconnected", "Disconnected");
+      } else if (streamingActive) {
+        // Unexpected disconnect while streaming
         setStatus("disconnected", "Disconnected");
         showError("Server disconnected unexpectedly. Click Start to reconnect.");
       } else {
@@ -263,6 +353,45 @@
     };
 
     return ws;
+  }
+
+  // ── Audio cleanup ──────────────────────────────────────────────────────
+  /**
+   * Stop mic tracks, disconnect audio graph, close AudioContext.
+   * Called when WebSocket closes (explicit stop or unexpected disconnect).
+   */
+  function cleanupAudioPipeline() {
+    // Stop mic tracks
+    if (micStream) {
+      micStream.getTracks().forEach(function (t) {
+        t.stop();
+        console.log("[transcriber] Mic track stopped:", t.label || t.id);
+      });
+      micStream = null;
+    }
+
+    // Disconnect audio graph
+    if (scriptNode) {
+      scriptNode.disconnect();
+      scriptNode.onaudioprocess = null;
+      scriptNode = null;
+    }
+    if (sourceNode) {
+      sourceNode.disconnect();
+      sourceNode = null;
+    }
+
+    // Close AudioContext
+    if (audioCtx && audioCtx.state !== "closed") {
+      audioCtx.close().then(function () {
+        console.log("[transcriber] AudioContext closed.");
+      }).catch(function (err) {
+        console.warn("[transcriber] AudioContext close warning:", err);
+      });
+      audioCtx = null;
+    }
+
+    sampleBuffer = [];
   }
 
   // ── Resampling ─────────────────────────────────────────────────────────
@@ -415,66 +544,179 @@
 
     // 5. Update UI
     streamingActive = true;
+    stopRequested = false;
     disableStart(true);
     disableStop(false);
+    disablePause(false);
+    disableResume(true);
+    disableSave(true);
     sampleBuffer = [];
+    console.log("[transcriber] Capture started — Pause and Upload enabled.");
   }
 
-  function stopCapture() {
+  /**
+   * Stop the current capture session.
+   *
+   * Sends a {"action":"stop"} control message to the server, then waits for
+   * the server to acknowledge with {"status":"stopped"} before cleaning up.
+   * The WebSocket is NOT closed here — the server closes it after finalizing.
+   *
+   * @param {boolean} sendStop - Default true. If false, skips the stop message
+   *   (used internally for cleanup-on-disconnect scenarios).
+   */
+  function stopCapture(sendStop) {
+    if (sendStop === undefined) sendStop = true;
+
     streamingActive = false;
+    stopRequested = sendStop;
 
-    // Close WebSocket (server will call finish_streaming)
-    if (ws) {
-      console.log("[transcriber] Closing WebSocket…");
-      ws.close(1000, "User stopped");
-      ws = null;
+    if (sendStop && ws && ws.readyState === WebSocket.OPEN) {
+      console.log("[transcriber] Sending stop control message…");
+      try {
+        ws.send(JSON.stringify({action: "stop"}));
+      } catch (e) {
+        console.error("[transcriber] Failed to send stop message:", e);
+      }
     }
 
-    // Stop mic tracks
-    if (micStream) {
-      micStream.getTracks().forEach(function (t) {
-        t.stop();
-        console.log("[transcriber] Mic track stopped:", t.label || t.id);
-      });
-      micStream = null;
-    }
-
-    // Disconnect audio graph
-    if (scriptNode) {
-      scriptNode.disconnect();
-      scriptNode.onaudioprocess = null;
-      scriptNode = null;
-    }
-    if (sourceNode) {
-      sourceNode.disconnect();
-      sourceNode = null;
-    }
-
-    // Close AudioContext
-    if (audioCtx && audioCtx.state !== "closed") {
-      audioCtx.close().then(function () {
-        console.log("[transcriber] AudioContext closed.");
-      }).catch(function (err) {
-        console.warn("[transcriber] AudioContext close warning:", err);
-      });
-      audioCtx = null;
-    }
-
-    // Update UI
-    disableStart(false);
+    // Disable control buttons; server will enable Save via status message
     disableStop(true);
-    setStatus("disconnected", "Disconnected");
-    sampleBuffer = [];
-    console.log("[transcriber] Capture stopped — pipeline cleaned up.");
+    disablePause(true);
+    disableResume(true);
+    disableStart(false);
+    // Save stays disabled until server sends {"status":"stopped"}
+    console.log("[transcriber] Stop requested — waiting for server acknowledgment.");
+  }
+
+  // ── Control actions ────────────────────────────────────────────────────
+
+  /** Send pause control message to server. */
+  function pauseCapture() {
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      console.warn("[transcriber] Cannot pause — WebSocket not open.");
+      return;
+    }
+    console.log("[transcriber] Sending pause control message…");
+    ws.send(JSON.stringify({action: "pause"}));
+    disablePause(true);
+    disableResume(false);
+  }
+
+  /** Send resume control message to server. */
+  function resumeCapture() {
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      console.warn("[transcriber] Cannot resume — WebSocket not open.");
+      return;
+    }
+    console.log("[transcriber] Sending resume control message…");
+    ws.send(JSON.stringify({action: "resume"}));
+    disablePause(false);
+    disableResume(true);
+  }
+
+  /** Fetch the timestamped markdown transcript and trigger a browser download. */
+  function saveTranscript() {
+    console.log("[transcriber] Fetching transcript export…");
+    fetch("/export")
+      .then(function (res) {
+        if (!res.ok) {
+          throw new Error("Export failed — server returned " + res.status);
+        }
+        return res.blob();
+      })
+      .then(function (blob) {
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = "transcript.md";
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+        console.log("[transcriber] Transcript saved as transcript.md");
+      })
+      .catch(function (err) {
+        console.error("[transcriber] Save failed:", err);
+        showError("Failed to save transcript: " + err.message);
+      });
+  }
+
+  /** Trigger the hidden file input for document upload. */
+  function uploadFile() {
+    fileUpload.click();
+  }
+
+  /** Handle the file input change event — upload the selected document. */
+  fileUpload.addEventListener("change", function () {
+    const file = fileUpload.files[0];
+    if (!file) return;
+
+    console.log("[transcriber] Uploading file:", file.name,
+      "(" + (file.size / 1024).toFixed(1) + " KB, type=" + file.type + ")");
+
+    const formData = new FormData();
+    formData.append("file", file);
+
+    fetch("/upload", {
+      method: "POST",
+      body: formData,
+    })
+      .then(function (res) {
+        return res.json().then(function (data) {
+          if (!res.ok) {
+            throw new Error(data.error || "Upload failed — server returned " + res.status);
+          }
+          return data;
+        });
+      })
+      .then(function (data) {
+        const charCount = data.extracted_chars || 0;
+        const msg = "Uploaded: " + file.name + " (" + charCount + " chars extracted)";
+        console.log("[transcriber] " + msg);
+        // Show a brief in-page notification instead of blocking alert
+        showUploadConfirm(msg);
+      })
+      .catch(function (err) {
+        console.error("[transcriber] Upload failed:", err);
+        showError("Upload failed: " + err.message);
+      });
+
+    // Reset input so the same file can be re-uploaded
+    fileUpload.value = "";
+  });
+
+  /**
+   * Show a brief upload confirmation that auto-hides after 3 seconds.
+   * Uses the error banner styling but with a success color.
+   */
+  function showUploadConfirm(msg) {
+    errorBanner.textContent = msg;
+    errorBanner.style.background = "#166534";
+    errorBanner.style.color = "#bbf7d0";
+    errorBanner.style.borderColor = "#15803d";
+    errorBanner.classList.add("visible");
+    setTimeout(function () {
+      errorBanner.classList.remove("visible");
+      errorBanner.style.background = "";
+      errorBanner.style.color = "";
+      errorBanner.style.borderColor = "";
+    }, 3000);
   }
 
   // ── Event listeners ────────────────────────────────────────────────────
   btnStart.addEventListener("click", startCapture);
-  btnStop.addEventListener("click", stopCapture);
+  btnStop.addEventListener("click", function () { stopCapture(true); });
+  btnPause.addEventListener("click", pauseCapture);
+  btnResume.addEventListener("click", resumeCapture);
+  btnSave.addEventListener("click", saveTranscript);
+  btnUpload.addEventListener("click", uploadFile);
 
   // ── Initial state ──────────────────────────────────────────────────────
   setStatus("disconnected", "Disconnected");
   disableStop(true);
+  disablePause(true);
+  disableResume(true);
+  disableSave(true);
 
   console.log("[transcriber] Frontend loaded. Ready.");
 })();
