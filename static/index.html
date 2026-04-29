@@ -207,23 +207,32 @@
   let sourceNode    = null;
   let ws            = null;
 
-  /** Accumulated resampled float32 samples waiting to be sent. */
-  let sampleBuffer  = [];
-  /** How many 16 kHz samples per chunk (≈500 ms). */
-  const SAMPLES_PER_CHUNK = 8000;
-  /** Chunk duration in seconds. */
-  const CHUNK_DURATION = SAMPLES_PER_CHUNK / 16000;
+  /** Raw resampled audio samples accumulated for the current phrase. */
+  let phraseBuffer  = [];
+  /** How many samples of continuous silence since last speech. */
+  let silenceSamples = 0;
+  /** True while the user is speaking (RMS above threshold). */
+  let speaking = false;
+
+  /** Silence detection constants. */
+  const SILENCE_RMS_THRESHOLD = 0.006;
+  const SILENCE_GAP_SAMPLES = 12000;   // ~750ms @ 16kHz
+  const MAX_PHRASE_SAMPLES   = 320000; // 20s max
+
   /** Native mic sample rate (filled when AudioContext is created). */
   let nativeSampleRate  = 0;
   /** Target sample rate for the ASR model. */
   const TARGET_SR = 16000;
 
   let streamingActive = false;
+  let paused = false;
   /** Set when user explicitly stops — onclose should not show error. */
   let stopRequested = false;
 
   /** Counter for audio chunks sent to the server. */
   let chunksSent = 0;
+  /** Total speech samples sent. */
+  let speechSamplesSent = 0;
 
   // ── UI helpers ─────────────────────────────────────────────────────────
   function setStatus(state, text) {
@@ -232,12 +241,12 @@
   }
 
   function showStats(state, serverChunks, segments) {
-    var durSec = (chunksSent * CHUNK_DURATION).toFixed(1);
+    var durSec = (speechSamplesSent / TARGET_SR).toFixed(1);
     var parts = [];
     if (segments != null) {
       parts.push(segments + " segment" + (segments !== 1 ? "s" : ""));
     }
-    parts.push(chunksSent + " chunks · ~" + durSec + "s audio");
+    parts.push(chunksSent + " chunk" + (chunksSent !== 1 ? "s" : "") + " · ~" + durSec + "s speech");
     if (state === "stopped") {
       parts.push("transcribed");
     }
@@ -318,8 +327,7 @@
           setStatus("paused", "Paused");
           disablePause(true);
           disableResume(false);
-          var durSec = (chunksSent * CHUNK_DURATION).toFixed(1);
-          statsEl.textContent = "paused · " + chunksSent + " chunks · ~" + durSec + "s audio pending";
+          statsEl.textContent = "paused · " + chunksSent + " chunk" + (chunksSent !== 1 ? "s" : "") + " sent";
           if (msg.text != null) {
             appendTranscript(msg.text);
           }
@@ -331,7 +339,7 @@
           setStatus("connected", "Connected");
           disablePause(false);
           disableResume(true);
-          statsEl.textContent = chunksSent + " chunks · recording…";
+          statsEl.textContent = "recording…";
           return;
         }
 
@@ -380,11 +388,13 @@
         setStatus("disconnected", "Disconnected");
         showError("Server disconnected unexpectedly. Click Start to reconnect.");
         chunksSent = 0;
+        speechSamplesSent = 0;
         statsEl.textContent = "";
       } else {
         setStatus("disconnected", "Disconnected");
       }
       ws = null;
+      paused = false;
     };
 
     ws.onerror = function (err) {
@@ -434,19 +444,16 @@
     }
 
     sampleBuffer = [];
+    phraseBuffer = [];
+    silenceSamples = 0;
+    speaking = false;
   }
 
   // ── Resampling ─────────────────────────────────────────────────────────
   /**
-   * Linear resample from native SR to TARGET_SR (16 kHz).
+   * Fast linear resample from native SR to TARGET_SR (16 kHz).
    *
-   * For each output sample at index i, find the two nearest input samples
-   * and linearly interpolate.
-   *
-   * @param {Float32Array} input  - Audio samples at nativeSampleRate.
-   * @param {number} inRate       - Native sample rate (Hz).
-   * @param {number} outRate      - Target sample rate (Hz, default 16000).
-   * @returns {Float32Array} Resampled mono audio.
+   * Uses precomputed index LUT for speed — runs once per audio callback.
    */
   function resample(input, inRate, outRate) {
     if (inRate === outRate) return new Float32Array(input);
@@ -466,62 +473,104 @@
     return output;
   }
 
+  // ── RMS energy ─────────────────────────────────────────────────────────
+  /** Compute RMS energy of a Float32Array. Returns 0..1. */
+  function rms(buffer) {
+    if (buffer.length === 0) return 0;
+    var sum = 0;
+    for (var i = 0; i < buffer.length; i++) {
+      sum += buffer[i] * buffer[i];
+    }
+    return Math.sqrt(sum / buffer.length);
+  }
+
+  // ── Send phrase ────────────────────────────────────────────────────────
+  /** Flatten and send accumulated speech samples as one binary frame. */
+  function sendPhrase() {
+    if (phraseBuffer.length === 0) return;
+    if (!ws || ws.readyState !== WebSocket.OPEN) { phraseBuffer = []; return; }
+
+    var total = 0;
+    for (var i = 0; i < phraseBuffer.length; i++) total += phraseBuffer[i].length;
+
+    var chunk = new Float32Array(total);
+    var off = 0;
+    for (var i = 0; i < phraseBuffer.length; i++) {
+      chunk.set(phraseBuffer[i], off);
+      off += phraseBuffer[i].length;
+    }
+    phraseBuffer = [];
+    silenceSamples = 0;
+    speaking = false;
+
+    try {
+      ws.send(chunk.buffer);
+      chunksSent++;
+      speechSamplesSent += total;
+      var dur = (speechSamplesSent / TARGET_SR).toFixed(1);
+      statsEl.textContent = chunksSent + " chunk" + (chunksSent !== 1 ? "s" : "") + " · ~" + dur + "s speech sent";
+      console.log("[transcriber] Sent phrase #" + chunksSent + ": " + total + " samples (" + (total / TARGET_SR).toFixed(2) + "s)");
+    } catch (e) {
+      console.error("[transcriber] WebSocket send failed:", e);
+    }
+  }
+
   // ── Audio pipeline ─────────────────────────────────────────────────────
   /**
-   * onaudioprocess handler for ScriptProcessorNode.
+   * onaudioprocess handler — silence detection + phrase segmentation.
    *
-   * 1. Convert input to mono (channel 0).
-   * 2. Resample to 16 kHz.
-   * 3. Accumulate in sampleBuffer.
-   * 4. Every ~SAMPLES_PER_CHUNK samples, drain buffer → Float32Array →
-   *    webSocket.send(buffer).
+   *  1. Resample to 16 kHz mono.
+   *  2. Compute RMS energy → classify speech vs silence.
+   *  3. Accumulate speech into phraseBuffer; track silence gap.
+   *  4. When silence exceeds SILENCE_GAP_SAMPLES → send accumulated phrase.
+   *  5. On pause / stop / disconnect → discard audio (don't send).
+   *  6. On forced max phrase length → auto-flush.
    */
   function onAudioProcess(event) {
+    if (!streamingActive) return;
+
+    var inputData = event.inputBuffer.getChannelData(0);
+    var resampled = resample(inputData, nativeSampleRate, TARGET_SR);
+
+    if (paused) return;  // drop audio while paused
+
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
 
-    const inputBuffer = event.inputBuffer;
-    const inputData = inputBuffer.getChannelData(0);  // Float32Array, native SR
+    var energy = rms(resampled);
+    var isSpeech = energy >= SILENCE_RMS_THRESHOLD;
 
-    // Resample to 16 kHz
-    const resampled = resample(inputData, nativeSampleRate, TARGET_SR);
+    if (isSpeech) {
+      silenceSamples = 0;
+      speaking = true;
+      phraseBuffer.push(resampled);
+    } else if (speaking) {
+      // In a silence gap — keep accumulating so we don't cut mid-word
+      phraseBuffer.push(resampled);
+      silenceSamples += resampled.length;
+    }
+    // If not speaking and not isSpeech: total silence, skip accumulating
 
-    // Accumulate
-    sampleBuffer.push(resampled);
-
-    // Count total samples accumulated
-    let totalSamples = 0;
-    for (let i = 0; i < sampleBuffer.length; i++) {
-      totalSamples += sampleBuffer[i].length;
+    // Force flush on very long phrases
+    var total = 0;
+    for (var i = 0; i < phraseBuffer.length; i++) total += phraseBuffer[i].length;
+    if (total >= MAX_PHRASE_SAMPLES) {
+      sendPhrase();
+      return;
     }
 
-    // Drain when we have enough
-    if (totalSamples >= SAMPLES_PER_CHUNK) {
-      // Flatten all buffers into one Float32Array
-      const chunk = new Float32Array(totalSamples);
-      let offset = 0;
-      for (let i = 0; i < sampleBuffer.length; i++) {
-        chunk.set(sampleBuffer[i], offset);
-        offset += sampleBuffer[i].length;
-      }
+    // Flush when silence gap is long enough
+    if (speaking && silenceSamples >= SILENCE_GAP_SAMPLES) {
+      sendPhrase();
+    }
+  }
 
-      // Send as binary WebSocket frame
-      try {
-        ws.send(chunk.buffer);
-        chunksSent++;
-        var durSec = (chunksSent * CHUNK_DURATION).toFixed(1);
-        statsEl.textContent = chunksSent + " chunks · ~" + durSec + "s buffered";
-        console.log(
-          "[transcriber] Sent audio chunk #" + chunksSent + ": " +
-          chunk.length + " samples (" +
-          (chunk.length / TARGET_SR).toFixed(2) + "s)"
-        );
-      } catch (e) {
-        console.error("[transcriber] WebSocket send failed:", e);
-        showError("Failed to send audio — connection may be closed.");
-      }
-
-      // Reset buffer
-      sampleBuffer = [];
+  // ── Flush any pending phrase ───────────────────────────────────────────
+  /** Called on stop — sends whatever speech is still buffered. */
+  function flushPendingPhrase() {
+    var total = 0;
+    for (var i = 0; i < phraseBuffer.length; i++) total += phraseBuffer[i].length;
+    if (total > 0) {
+      sendPhrase();
     }
   }
 
@@ -589,16 +638,20 @@
 
     // 5. Update UI
     streamingActive = true;
+    paused = false;
     stopRequested = false;
     chunksSent = 0;
+    speechSamplesSent = 0;
+    phraseBuffer = [];
+    silenceSamples = 0;
+    speaking = false;
     statsEl.textContent = "";
     disableStart(true);
     disableStop(false);
     disablePause(false);
     disableResume(true);
     disableSave(true);
-    sampleBuffer = [];
-    console.log("[transcriber] Capture started — Pause and Upload enabled.");
+    console.log("[transcriber] Capture started — silence detection active. Pause/Upload enabled.");
   }
 
   /**
@@ -615,7 +668,11 @@
     if (sendStop === undefined) sendStop = true;
 
     streamingActive = false;
+    paused = true;
     stopRequested = sendStop;
+
+    // Flush any remaining speech before sending stop
+    flushPendingPhrase();
 
     if (sendStop && ws && ws.readyState === WebSocket.OPEN) {
       console.log("[transcriber] Sending stop control message…");
@@ -643,10 +700,14 @@
       console.warn("[transcriber] Cannot pause — WebSocket not open.");
       return;
     }
+    // Flush current phrase before pausing
+    flushPendingPhrase();
+    paused = true;
     console.log("[transcriber] Sending pause control message…");
     ws.send(JSON.stringify({action: "pause"}));
     disablePause(true);
     disableResume(false);
+    statsEl.textContent = "paused · " + chunksSent + " chunk" + (chunksSent !== 1 ? "s" : "") + " sent";
   }
 
   /** Send resume control message to server. */
@@ -655,10 +716,12 @@
       console.warn("[transcriber] Cannot resume — WebSocket not open.");
       return;
     }
+    paused = false;
     console.log("[transcriber] Sending resume control message…");
     ws.send(JSON.stringify({action: "resume"}));
     disablePause(false);
     disableResume(true);
+    statsEl.textContent = chunksSent + " chunk" + (chunksSent !== 1 ? "s" : "") + " · recording…";
   }
 
   /** Fetch the timestamped markdown transcript and trigger a browser download. */
