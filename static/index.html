@@ -122,6 +122,17 @@
     color: #b0a89c;
   }
 
+  /* Stats bar */
+  .stats {
+    width: 100%;
+    max-width: 780px;
+    margin-top: 0.35rem;
+    font-size: 0.78rem;
+    color: #8b8680;
+    text-align: right;
+    min-height: 1.2em;
+  }
+
   /* Error banner */
   .error-banner {
     width: 100%;
@@ -169,6 +180,7 @@
 
 <div id="status" class="status status-disconnected">Disconnected</div>
 <div id="transcript" class="transcript-box"></div>
+<div id="stats" class="stats"></div>
 <div id="errorBanner" class="error-banner"></div>
 
 <script>
@@ -185,6 +197,7 @@
   const fileUpload = document.getElementById("fileUpload");
   const statusEl   = document.getElementById("status");
   const transcriptEl = document.getElementById("transcript");
+  const statsEl      = document.getElementById("stats");
   const errorBanner  = document.getElementById("errorBanner");
 
   // ── State ──────────────────────────────────────────────────────────────
@@ -198,6 +211,8 @@
   let sampleBuffer  = [];
   /** How many 16 kHz samples per chunk (≈500 ms). */
   const SAMPLES_PER_CHUNK = 8000;
+  /** Chunk duration in seconds. */
+  const CHUNK_DURATION = SAMPLES_PER_CHUNK / 16000;
   /** Native mic sample rate (filled when AudioContext is created). */
   let nativeSampleRate  = 0;
   /** Target sample rate for the ASR model. */
@@ -207,10 +222,26 @@
   /** Set when user explicitly stops — onclose should not show error. */
   let stopRequested = false;
 
+  /** Counter for audio chunks sent to the server. */
+  let chunksSent = 0;
+
   // ── UI helpers ─────────────────────────────────────────────────────────
   function setStatus(state, text) {
     statusEl.textContent = text;
     statusEl.className = "status status-" + state;
+  }
+
+  function showStats(state, serverChunks, segments) {
+    var durSec = (chunksSent * CHUNK_DURATION).toFixed(1);
+    var parts = [];
+    if (segments != null) {
+      parts.push(segments + " segment" + (segments !== 1 ? "s" : ""));
+    }
+    parts.push(chunksSent + " chunks · ~" + durSec + "s audio");
+    if (state === "stopped") {
+      parts.push("transcribed");
+    }
+    statsEl.textContent = parts.join(" · ");
   }
 
   function showError(msg) {
@@ -287,6 +318,8 @@
           setStatus("paused", "Paused");
           disablePause(true);
           disableResume(false);
+          var durSec = (chunksSent * CHUNK_DURATION).toFixed(1);
+          statsEl.textContent = "paused · " + chunksSent + " chunks · ~" + durSec + "s audio pending";
           if (msg.text != null) {
             appendTranscript(msg.text);
           }
@@ -298,6 +331,7 @@
           setStatus("connected", "Connected");
           disablePause(false);
           disableResume(true);
+          statsEl.textContent = chunksSent + " chunks · recording…";
           return;
         }
 
@@ -309,6 +343,9 @@
           disableStop(true);
           disableSave(false);
           disableStart(false);
+          if (msg.chunks != null) {
+            showStats("stopped", msg.chunks, msg.segments);
+          }
           return;
         }
 
@@ -335,13 +372,15 @@
       cleanupAudioPipeline();
 
       if (stopRequested) {
-        // User explicitly stopped — normal teardown
+        // User explicitly stopped — normal teardown, keep stats visible
         stopRequested = false;
         setStatus("disconnected", "Disconnected");
       } else if (streamingActive) {
         // Unexpected disconnect while streaming
         setStatus("disconnected", "Disconnected");
         showError("Server disconnected unexpectedly. Click Start to reconnect.");
+        chunksSent = 0;
+        statsEl.textContent = "";
       } else {
         setStatus("disconnected", "Disconnected");
       }
@@ -468,8 +507,11 @@
       // Send as binary WebSocket frame
       try {
         ws.send(chunk.buffer);
+        chunksSent++;
+        var durSec = (chunksSent * CHUNK_DURATION).toFixed(1);
+        statsEl.textContent = chunksSent + " chunks · ~" + durSec + "s buffered";
         console.log(
-          "[transcriber] Sent audio chunk: " +
+          "[transcriber] Sent audio chunk #" + chunksSent + ": " +
           chunk.length + " samples (" +
           (chunk.length / TARGET_SR).toFixed(2) + "s)"
         );
@@ -548,6 +590,8 @@
     // 5. Update UI
     streamingActive = true;
     stopRequested = false;
+    chunksSent = 0;
+    statsEl.textContent = "";
     disableStart(true);
     disableStop(false);
     disablePause(false);

@@ -292,9 +292,16 @@ async def websocket_transcribe(ws: WebSocket) -> None:
                             {"text": result.text, "time": time.time()}
                         )
                         state = None
+                        await ws.send_json(
+                            {"text": result.text, "language": _transcriber.language}
+                        )
                     _session_active = False
                     _session_paused = False
-                    await ws.send_json({"status": "stopped"})
+                    await ws.send_json({
+                        "status": "stopped",
+                        "chunks": chunk_count,
+                        "segments": len(_session_transcript),
+                    })
                     logger.info(
                         "Stop: session stopped — %d segments accumulated.",
                         len(_session_transcript),
