@@ -29,7 +29,7 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass
-from threading import Thread
+from threading import Lock, Thread
 from typing import Any, Dict, List, Optional
 
 import numpy as np
@@ -63,11 +63,17 @@ class _StreamState:
     process: subprocess.Popen
     accumulated: str
     stderr_lines: List[str]
+    _lock: Any  # threading.Lock
 
     @property
     def text(self) -> str:
         """Compatibility with ASRStreamingState.text."""
-        return self.accumulated
+        with self._lock:
+            return self.accumulated
+
+    def _append_text(self, chunk: str) -> None:
+        with self._lock:
+            self.accumulated += chunk
 
     def kill(self) -> None:
         try:
@@ -282,9 +288,28 @@ class TranscriberCPU:
             process=process,
             accumulated="",
             stderr_lines=[],
+            _lock=Lock(),
         )
 
-        # Start a background thread to capture stderr
+        # Background thread: continuously read stdout into state.accumulated
+        def _read_stdout() -> None:
+            if process.stdout is None:
+                return
+            try:
+                for chunk_bytes in iter(lambda: process.stdout.read(256), b""):
+                    if not chunk_bytes:
+                        break
+                    try:
+                        chunk = chunk_bytes.decode("utf-8", errors="replace")
+                    except Exception:
+                        continue
+                    state._append_text(chunk)
+            except (OSError, ValueError):
+                pass
+
+        Thread(target=_read_stdout, daemon=True).start()
+
+        # Background thread: capture stderr for diagnostics
         def _read_stderr() -> None:
             if process.stderr is None:
                 return
@@ -306,8 +331,9 @@ class TranscriberCPU:
     ) -> str:
         """Process one audio chunk and return the latest partial text.
 
-        Converts float32 audio to s16le, writes to the subprocess stdin,
-        then reads any available stdout output.
+        Converts float32 audio to s16le, writes to the subprocess stdin.
+        A background thread continuously reads stdout into state.accumulated,
+        so this call just returns whatever text has arrived so far.
 
         Args:
             audio_chunk: 1-D ``float32`` NumPy array, 16 kHz mono PCM.
@@ -318,13 +344,12 @@ class TranscriberCPU:
         """
         process = state.process
         if process.stdin is None or process.poll() is not None:
-            return state.accumulated
+            return state.text
+
+        if len(audio_chunk) == 0:
+            return state.text
 
         # Convert float32 → s16le
-        if len(audio_chunk) == 0:
-            return state.accumulated
-
-        # Clamp to [-1, 1] and convert to int16
         clamped = np.clip(audio_chunk, -1.0, 1.0)
         int16_data = (clamped * 32767).astype(np.int16)
 
@@ -333,31 +358,8 @@ class TranscriberCPU:
             process.stdin.flush()
         except (BrokenPipeError, OSError):
             logger.warning("qwen_asr subprocess stdin closed.")
-            return state.accumulated
 
-        # Read available stdout (non-blocking via select on Unix)
-        if process.stdout is None:
-            return state.accumulated
-
-        new_text = ""
-        try:
-            import select
-            while True:
-                ready, _, _ = select.select([process.stdout], [], [], 0.0)
-                if not ready:
-                    break
-                # Read a chunk of available data
-                data = os.read(process.stdout.fileno(), 4096)
-                if not data:
-                    break
-                new_text += data.decode("utf-8", errors="replace")
-        except (OSError, ValueError):
-            pass
-
-        if new_text:
-            state.accumulated += new_text
-
-        return state.accumulated
+        return state.text
 
     def finish_streaming(self, state: _StreamState) -> TranscriptionResult:
         """Finalise a streaming session and return the complete transcription.
@@ -389,7 +391,7 @@ class TranscriberCPU:
             try:
                 remaining = process.stdout.read()
                 if remaining:
-                    state.accumulated += remaining.decode("utf-8", errors="replace")
+                    state._append_text(remaining.decode("utf-8", errors="replace"))
             except Exception:
                 pass
 
@@ -401,7 +403,7 @@ class TranscriberCPU:
             state.kill()
 
         elapsed = time.perf_counter() - t_start
-        text = state.accumulated.strip()
+        text = state.text.strip()
 
         logger.info(
             "CPU streaming finalised in %.2f s (%d chars).",

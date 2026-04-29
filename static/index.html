@@ -290,6 +290,45 @@
     transcriptEl.scrollTop = transcriptEl.scrollHeight;
   }
 
+  // ── Transcript accumulation ────────────────────────────────────────────
+  /** Completed segment texts (one per pause/stop). */
+  let transcriptSegments = [];
+  /** Current live streaming partial from the ASR. */
+  let currentPartial = "";
+
+  function updateTranscriptDisplay() {
+    var parts = [];
+    for (var i = 0; i < transcriptSegments.length; i++) {
+      var t = transcriptSegments[i].trim();
+      if (t) parts.push(t);
+    }
+    var cp = currentPartial.trim();
+    if (cp) parts.push(cp);
+    transcriptEl.textContent = parts.join("\n\n");
+    transcriptEl.scrollTop = transcriptEl.scrollHeight;
+  }
+
+  /** Called on each streaming partial update from the server. */
+  function setPartial(text) {
+    currentPartial = text || "";
+    updateTranscriptDisplay();
+  }
+
+  /** Called on pause / stop — saves current partial as a completed segment. */
+  function commitSegment(text) {
+    var t = (text || currentPartial || "").trim();
+    if (t) transcriptSegments.push(t);
+    currentPartial = "";
+    updateTranscriptDisplay();
+  }
+
+  /** Reset transcript for a new recording session. */
+  function resetTranscript() {
+    transcriptSegments = [];
+    currentPartial = "";
+    updateTranscriptDisplay();
+  }
+
   // ── WebSocket client ───────────────────────────────────────────────────
   function connectWebSocket() {
     const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
@@ -329,7 +368,7 @@
           disableResume(false);
           statsEl.textContent = "paused · " + chunksSent + " chunk" + (chunksSent !== 1 ? "s" : "") + " sent";
           if (msg.text != null) {
-            appendTranscript(msg.text);
+            commitSegment(msg.text);
           }
           return;
         }
@@ -339,6 +378,8 @@
           setStatus("connected", "Connected");
           disablePause(false);
           disableResume(true);
+          currentPartial = "";
+          updateTranscriptDisplay();
           statsEl.textContent = "recording…";
           return;
         }
@@ -351,6 +392,7 @@
           disableStop(true);
           disableSave(false);
           disableStart(false);
+          commitSegment(currentPartial);
           if (msg.chunks != null) {
             showStats("stopped", msg.chunks, msg.segments);
           }
@@ -363,7 +405,7 @@
             "[transcriber] Transcript update (" +
               msg.text.length + " chars, language=" + msg.language + ")"
           );
-          appendTranscript(msg.text);
+          setPartial(msg.text);
         }
       } catch (e) {
         console.warn("[transcriber] Failed to parse server message:", e);
@@ -645,6 +687,7 @@
     phraseBuffer = [];
     silenceSamples = 0;
     speaking = false;
+    resetTranscript();
     statsEl.textContent = "";
     disableStart(true);
     disableStop(false);
