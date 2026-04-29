@@ -29,7 +29,7 @@
     margin-bottom: 1.5rem;
   }
 
-  /* Controls */
+  /* outlined paper buttons (T04 paper-like aesthetic) */
   .controls {
     display: flex;
     gap: 0.75rem;
@@ -673,7 +673,7 @@
         });
       })
       .then(function (data) {
-        const charCount = data.extracted_chars || 0;
+        const charCount = data.chars || 0;
         const msg = "Uploaded: " + file.name + " (" + charCount + " chars extracted)";
         console.log("[transcriber] " + msg);
         // Show a brief in-page notification instead of blocking alert
@@ -694,9 +694,9 @@
    */
   function showUploadConfirm(msg) {
     errorBanner.textContent = msg;
-    errorBanner.style.background = "#166534";
-    errorBanner.style.color = "#bbf7d0";
-    errorBanner.style.borderColor = "#15803d";
+    errorBanner.style.background = "#d4edda";
+    errorBanner.style.color = "#155724";
+    errorBanner.style.borderColor = "#c3e6cb";
     errorBanner.classList.add("visible");
     setTimeout(function () {
       errorBanner.classList.remove("visible");
