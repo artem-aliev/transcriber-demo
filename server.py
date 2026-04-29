@@ -75,7 +75,7 @@ _cpu_mode: bool = os.environ.get("TRANSCRIBER_CPU", "") == "1"
 _cpu_model_dir: str = os.environ.get("TRANSCRIBER_CPU_MODEL_DIR", "qwen3-asr-0.6b")
 """Model directory for CPU mode."""
 
-_cpu_binary_path: str = os.environ.get("TRANSCRIBER_CPU_BINARY", "./qwen_asr")
+_cpu_binary_path: str = os.environ.get("TRANSCRIBER_CPU_BINARY", "./qwen-asr/qwen_asr")
 """Path to the qwen_asr binary for CPU mode."""
 
 _active_streaming: bool = False
@@ -698,8 +698,8 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--cpu-binary-path",
-        default="./qwen_asr",
-        help="Path to qwen_asr binary (default: ./qwen_asr).",
+        default="./qwen-asr/qwen_asr",
+        help="Path to qwen_asr binary (default: ./qwen-asr/qwen_asr).",
     )
     parser.add_argument(
         "--host",

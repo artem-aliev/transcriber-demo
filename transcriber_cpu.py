@@ -100,7 +100,7 @@ class TranscriberCPU:
     Args:
         model_dir: Path to the directory containing model safetensors and
             config files (e.g. ``qwen3-asr-0.6b``).
-        binary_path: Path to the ``qwen_asr`` binary (default: ``./qwen_asr``).
+        binary_path: Path to the ``qwen_asr`` binary (default: ``./qwen-asr/qwen_asr``).
         language: Forced output language (default ``"English"``).
         context: Optional domain-hint text fed via ``--prompt``.
     """
@@ -108,34 +108,35 @@ class TranscriberCPU:
     def __init__(
         self,
         model_dir: str = "qwen3-asr-0.6b",
-        binary_path: str = "./qwen_asr",
+        binary_path: str = "./qwen-asr/qwen_asr",
         language: str = "English",
         context: str = "",
     ) -> None:
-        self._model_dir = model_dir
-        self._binary_path = binary_path
+        # Resolve paths immediately so they survive chdir (uvicorn, etc.)
+        self._binary_path = os.path.abspath(binary_path)
+        self._model_dir = os.path.abspath(model_dir)
         self._language = language
         self._context = context
 
         # Validate binary
-        if not os.path.isfile(binary_path):
+        if not os.path.isfile(self._binary_path):
             # Try finding it alongside this file or in PATH
-            found = shutil.which(binary_path) or shutil.which("qwen_asr")
+            found = shutil.which(self._binary_path) or shutil.which("qwen_asr")
             if found:
                 self._binary_path = found
             else:
                 logger.warning(
                     "qwen_asr binary not found at %s. "
                     "Run setup_cpu.sh to compile it.",
-                    binary_path,
+                    self._binary_path,
                 )
 
         # Validate model directory
-        if not os.path.isdir(model_dir):
+        if not os.path.isdir(self._model_dir):
             logger.warning(
                 "Model directory %s not found. "
                 "Run setup_cpu.sh to download the model.",
-                model_dir,
+                self._model_dir,
             )
 
         logger.info(
@@ -421,7 +422,7 @@ class TranscriberCPU:
 
 def create_transcriber_cpu(
     model_dir: str = "qwen3-asr-0.6b",
-    binary_path: str = "./qwen_asr",
+    binary_path: str = "./qwen-asr/qwen_asr",
     language: str = "English",
     context: str = "",
 ) -> TranscriberCPU:
