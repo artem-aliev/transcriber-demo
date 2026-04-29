@@ -286,8 +286,10 @@ async def websocket_transcribe(ws: WebSocket) -> None:
 
                 # ── "stop": finalise and end session ─────────────────────
                 elif action == "stop":
+                    final_text = ""
                     if state is not None:
                         result = _transcriber.finish_streaming(state)
+                        final_text = result.text
                         _session_transcript.append(
                             {"text": result.text, "time": time.time()}
                         )
@@ -299,6 +301,7 @@ async def websocket_transcribe(ws: WebSocket) -> None:
                     _session_paused = False
                     await ws.send_json({
                         "status": "stopped",
+                        "text": final_text,
                         "chunks": chunk_count,
                         "segments": len(_session_transcript),
                     })

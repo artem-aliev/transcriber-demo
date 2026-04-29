@@ -317,7 +317,10 @@
   /** Called on pause / stop — saves current partial as a completed segment. */
   function commitSegment(text) {
     var t = (text || currentPartial || "").trim();
-    if (t) transcriptSegments.push(t);
+    if (t) {
+      transcriptSegments.push(t);
+      console.log("[transcriber] Segment committed (" + t.length + " chars) — total segments: " + transcriptSegments.length);
+    }
     currentPartial = "";
     updateTranscriptDisplay();
   }
@@ -392,7 +395,7 @@
           disableStop(true);
           disableSave(false);
           disableStart(false);
-          commitSegment(currentPartial);
+          commitSegment(msg.text || currentPartial);
           if (msg.chunks != null) {
             showStats("stopped", msg.chunks, msg.segments);
           }
