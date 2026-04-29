@@ -29,3 +29,8 @@ vendor/
 coverage/
 .cache/
 tmp/
+
+# ── CPU backend artifacts (locally built/downloaded) ──
+qwen-asr/
+qwen3-asr-0.6b/
+qwen3-asr-1.7b/
