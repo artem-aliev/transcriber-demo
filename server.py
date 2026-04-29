@@ -39,7 +39,14 @@ from fastapi.responses import JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from starlette.responses import FileResponse
 
-from transcriber import Transcriber
+try:
+    from transcriber import Transcriber
+    _gpu_available = True
+except ImportError:
+    Transcriber = None  # type: ignore[assignment]
+    _gpu_available = False
+
+from transcriber_cpu import TranscriberCPU
 
 # ── Structured logger (same pattern as transcriber.py) ──────────────────────
 logger = logging.getLogger("server")
@@ -55,12 +62,21 @@ logger.addHandler(_handler)
 
 
 # ── Module-level state ──────────────────────────────────────────────────────
-_transcriber: Optional[Transcriber] = None
+_transcriber = None
 """Module-level Transcriber instance.  If model load fails, this stays ``None``
 and ``/ws`` returns 503."""
 
 _model_available: bool = False
 """Set to ``True`` after successful model load in the lifespan handler."""
+
+_cpu_mode: bool = os.environ.get("TRANSCRIBER_CPU", "") == "1"
+"""Whether the server is running in CPU mode (using TranscriberCPU)."""
+
+_cpu_model_dir: str = os.environ.get("TRANSCRIBER_CPU_MODEL_DIR", "qwen3-asr-0.6b")
+"""Model directory for CPU mode."""
+
+_cpu_binary_path: str = os.environ.get("TRANSCRIBER_CPU_BINARY", "./qwen_asr")
+"""Path to the qwen_asr binary for CPU mode."""
 
 _active_streaming: bool = False
 """Tracks whether a WebSocket streaming session is currently active.
@@ -94,23 +110,43 @@ async def lifespan(app: FastAPI):
     """Load the Transcriber model at startup, clean up on shutdown."""
     global _transcriber, _model_available
 
-    logger.info("Server starting — loading ASR model…")
-    try:
-        _transcriber = Transcriber()
-        _model_available = True
-        logger.info("ASR model loaded successfully. Server ready.")
-    except (ImportError, RuntimeError) as exc:
-        logger.error("Model load failed: %s", exc)
-        logger.error(
-            "Server will start, but /ws will return 503 until the model "
-            "is available."
-        )
-        _model_available = False
-    except Exception:
-        logger.error(
-            "Unexpected error during model load:\n%s", traceback.format_exc()
-        )
-        _model_available = False
+    if _cpu_mode:
+        logger.info("Server starting in CPU mode — loading TranscriberCPU…")
+        try:
+            _transcriber = TranscriberCPU(
+                model_dir=_cpu_model_dir,
+                binary_path=_cpu_binary_path,
+                language="English",
+            )
+            _model_available = True
+            logger.info("CPU ASR engine ready. Server ready.")
+        except Exception as exc:
+            logger.error("CPU model load failed: %s", exc)
+            logger.error(
+                "Server will start, but /ws will return 503 until the model "
+                "is available."
+            )
+            _model_available = False
+    else:
+        logger.info("Server starting — loading GPU ASR model…")
+        try:
+            if Transcriber is None:
+                raise ImportError("GPU backend (transcriber) not available")
+            _transcriber = Transcriber()
+            _model_available = True
+            logger.info("ASR model loaded successfully. Server ready.")
+        except (ImportError, RuntimeError) as exc:
+            logger.error("Model load failed: %s", exc)
+            logger.error(
+                "Server will start, but /ws will return 503 until the model "
+                "is available."
+            )
+            _model_available = False
+        except Exception:
+            logger.error(
+                "Unexpected error during model load:\n%s", traceback.format_exc()
+            )
+            _model_available = False
 
     yield  # ── Server runs here ──
 
@@ -418,6 +454,7 @@ async def health() -> Dict[str, Any]:
         "active_streaming": _active_streaming,
         "session_active": _session_active,
         "session_paused": _session_paused,
+        "cpu_mode": _cpu_mode,
     }
 
 
@@ -643,12 +680,48 @@ async def export_transcript() -> Response:
 # ── Entrypoint ──────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
+    import argparse
     import uvicorn
+
+    parser = argparse.ArgumentParser(description="Transcriber Server")
+    parser.add_argument(
+        "--cpu",
+        action="store_true",
+        help="Run in CPU mode using antirez/qwen-asr binary (no GPU required).",
+    )
+    parser.add_argument(
+        "--cpu-model-dir",
+        default="qwen3-asr-0.6b",
+        help="Model directory for CPU mode (default: qwen3-asr-0.6b).",
+    )
+    parser.add_argument(
+        "--cpu-binary-path",
+        default="./qwen_asr",
+        help="Path to qwen_asr binary (default: ./qwen_asr).",
+    )
+    parser.add_argument(
+        "--host",
+        default="0.0.0.0",
+        help="Bind address (default: 0.0.0.0).",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=5000,
+        help="Bind port (default: 5000).",
+    )
+    args = parser.parse_args()
+
+    if args.cpu:
+        os.environ["TRANSCRIBER_CPU"] = "1"
+        os.environ["TRANSCRIBER_CPU_MODEL_DIR"] = args.cpu_model_dir
+        os.environ["TRANSCRIBER_CPU_BINARY"] = args.cpu_binary_path
+        print(f"CPU mode: model={args.cpu_model_dir}, binary={args.cpu_binary_path}")
 
     uvicorn.run(
         "server:app",
-        host="0.0.0.0",
-        port=5000,
+        host=args.host,
+        port=args.port,
         log_level="info",
         reload=False,
     )

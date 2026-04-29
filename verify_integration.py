@@ -213,7 +213,7 @@ def grep(pattern: str, filepath: str) -> bool:
     import subprocess
     try:
         subprocess.run(
-            ["grep", "-q", pattern, filepath],
+            ["grep", "-q", "-e", pattern, filepath],
             check=True,
             capture_output=True,
         )
@@ -231,7 +231,7 @@ def grep_count(pattern: str, filepath: str) -> int:
     """Return match count."""
     try:
         result = subprocess.run(
-            ["grep", "-c", pattern, filepath],
+            ["grep", "-c", "-e", pattern, filepath],
             check=True,
             capture_output=True,
             text=True,
@@ -316,6 +316,27 @@ def static_checks() -> None:
     check("R008: no npm/build", grep_not("package.json", str(PROJECT_ROOT)), "")
     check("R008: no framework import", grep_not("import React", html), "")
     check("R008: vanilla JS", grep("use strict", html), "")
+
+    # ── CPU mode (transcriber_cpu.py) ──────────────────────────────────
+    cpu_py = "transcriber_cpu.py"
+    if os.path.exists(cpu_py):
+        check("CPU: TranscriberCPU class", grep("class TranscriberCPU", cpu_py), "")
+        check("CPU: transcribe_file method", grep("def transcribe_file", cpu_py), "")
+        check("CPU: start_streaming method", grep("def start_streaming", cpu_py), "")
+        check("CPU: stream_chunk method", grep("def stream_chunk", cpu_py), "")
+        check("CPU: finish_streaming method", grep("def finish_streaming", cpu_py), "")
+        check("CPU: update_context method", grep("def update_context", cpu_py), "")
+        check("CPU: _StreamState class", grep("class _StreamState", cpu_py), "")
+        check("CPU: text property", grep("def text", cpu_py), "")
+        check("CPU: s16le conversion", grep("int16", cpu_py), "")
+        check("CPU: subprocess stdin", grep("stdin", cpu_py), "")
+        check("CPU: --stdin --stream flags", grep("--stream", cpu_py), "")
+
+    # ── Server CPU mode support ─────────────────────────────────────────
+    check("Srv: cpu_mode env var", grep("TRANSCRIBER_CPU", "server.py"), "")
+    check("Srv: TranscriberCPU import", grep("from transcriber_cpu import", "server.py"), "")
+    check("Srv: --cpu CLI arg", grep("--cpu", "server.py"), "")
+    check("Srv: cpu_mode in /health", grep("cpu_mode", "server.py"), "")
 
     # ── Edge cases ────────────────────────────────────────────────────
     check("Edge: pause guard (skip audio)", grep("Audio frame skipped", "server.py"), "")
