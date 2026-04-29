@@ -235,12 +235,12 @@ async def websocket_transcribe(ws: WebSocket) -> None:
 
         # ── Receive loop ─────────────────────────────────────────────────
         while True:
-            data = await ws.receive()  
+            frame = await ws.receive()
 
             # ── Text frame: control protocol ────────────────────────────
-            if isinstance(data, str):
+            if "text" in frame:
                 try:
-                    msg = json.loads(data)
+                    msg = json.loads(frame["text"])
                 except json.JSONDecodeError:
                     logger.warning(
                         "Invalid JSON in control message from %s:%d.",
@@ -316,14 +316,16 @@ async def websocket_transcribe(ws: WebSocket) -> None:
                 continue
 
             # ── Binary frame: audio processing ──────────────────────────
-            if not isinstance(data, bytes):
+            if "bytes" not in frame:
                 logger.warning(
                     "Unexpected WebSocket frame type %s from %s:%d — ignoring.",
-                    type(data).__name__,
+                    set(frame.keys()) - {"type"},
                     client_host,
                     client_port,
                 )
                 continue
+
+            raw_bytes = frame["bytes"]
 
             # Pause guard: silently skip audio frames while paused
             if _session_paused:
@@ -337,7 +339,7 @@ async def websocket_transcribe(ws: WebSocket) -> None:
                 logger.info("Recording session active — first audio chunk received.")
 
             # Guard: skip zero-length frames
-            if len(data) == 0:
+            if len(raw_bytes) == 0:
                 logger.debug(
                     "Skipping zero-length binary frame (chunk %d).",
                     chunk_count + 1,
@@ -348,14 +350,14 @@ async def websocket_transcribe(ws: WebSocket) -> None:
 
             # Convert bytes to float32 array
             try:
-                audio_chunk = np.frombuffer(data, dtype=np.float32)
+                audio_chunk = np.frombuffer(raw_bytes, dtype=np.float32)
             except ValueError:
                 logger.warning(
                     "Chunk %d: byte payload size %d is not a multiple of "
                     "float32 size — np.frombuffer will handle remainder. "
                     "Skipping frame.",
                     chunk_count,
-                    len(data),
+                    len(raw_bytes),
                 )
                 await ws.send_json({"error": "Invalid audio frame: byte size "
                                               "not aligned to float32"})
