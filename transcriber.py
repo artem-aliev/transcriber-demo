@@ -242,12 +242,12 @@ class Transcriber:
     def start_streaming(
         self,
         chunk_size_sec: float = 2.0,
-    ) -> Dict[str, Any]:
+    ) -> Any:
         """Initialise a streaming transcription session.
 
-        Returns a state object that must be passed to ``stream_chunk()``
-        and ``finish_streaming()``.  The state is a mutable dictionary
-        managed by the vLLM backend.
+        Returns an ``ASRStreamingState`` object that must be passed to
+        ``stream_chunk()`` and ``finish_streaming()``.  Access partial
+        text via ``state.text`` (attribute, not dict key).
 
         Args:
             chunk_size_sec: Duration (seconds) of each audio chunk the
@@ -255,8 +255,8 @@ class Transcriber:
                 *unfixed_chunk_num* to determine the rollback window.
 
         Returns:
-            A streaming-state dictionary.  Its ``"text"`` key holds the
-            latest partial transcription.
+            An ``ASRStreamingState`` object.  Its ``.text`` attribute
+            holds the latest partial transcription.
         """
         logger.info(
             "Starting streaming session (chunk_size_sec=%.1f, language=%s).",
@@ -264,7 +264,7 @@ class Transcriber:
             self._language,
         )
 
-        state: Dict[str, Any] = self._model.init_streaming_state(
+        state = self._model.init_streaming_state(
             context=self._context if self._context else "",
             language=self._language,
             unfixed_chunk_num=2,
@@ -277,13 +277,13 @@ class Transcriber:
     def stream_chunk(
         self,
         audio_chunk: np.ndarray,
-        state: Dict[str, Any],
+        state: Any,
     ) -> str:
         """Process one audio chunk and return the latest partial text.
 
         Args:
             audio_chunk: 1-D ``float32`` NumPy array, 16 kHz mono PCM.
-            state: The streaming-state dictionary returned by
+            state: The ``ASRStreamingState`` returned by
                 :meth:`start_streaming`.
 
         Returns:
@@ -292,17 +292,16 @@ class Transcriber:
         """
         # vLLM's streaming_transcribe mutates state in-place.
         self._model.streaming_transcribe(audio_chunk, state)
-        return state["text"]
+        return state.text
 
-    def finish_streaming(self, state: Dict[str, Any]) -> TranscriptionResult:
+    def finish_streaming(self, state: Any) -> TranscriptionResult:
         """Finalise a streaming session and return the complete transcription.
 
         **Must be called** after the last chunk — otherwise the final
         token(s) remain uncommitted and the output will be truncated.
 
         Args:
-            state: The streaming-state dictionary from
-                :meth:`start_streaming`.
+            state: The ``ASRStreamingState`` from :meth:`start_streaming`.
 
         Returns:
             ``TranscriptionResult`` with the final, complete text.
@@ -313,7 +312,7 @@ class Transcriber:
         self._model.finish_streaming_transcribe(state)
         elapsed = time.perf_counter() - t_start
 
-        text = state["text"]
+        text = state.text
         logger.info(
             "Streaming finalised in %.2f s (%d chars).",
             elapsed,

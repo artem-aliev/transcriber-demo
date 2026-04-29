@@ -183,15 +183,16 @@ async def websocket_transcribe(ws: WebSocket) -> None:
         )
     _active_streaming = True
 
-    state: Optional[Dict[str, Any]] = None
+    state: Any = None
     chunk_count = 0
     total_text_chars = 0
 
     try:
         # ── Start streaming ──────────────────────────────────────────────
         state = _transcriber.start_streaming(chunk_size_sec=2.0)
-        # vLLM's init_streaming_state returns a dict with a "text" key.
-        initial_text = state.get("text", "")
+        # vLLM's init_streaming_state returns an ASRStreamingState object
+        # with .text and .language attributes.
+        initial_text = state.text
         if initial_text:
             await ws.send_json({"text": initial_text, "language": _transcriber.language})
             logger.info("Initial text sent (%d chars).", len(initial_text))
@@ -238,7 +239,7 @@ async def websocket_transcribe(ws: WebSocket) -> None:
                 # ── "resume": start a new ASR streaming segment ─────────
                 elif action == "resume":
                     state = _transcriber.start_streaming(chunk_size_sec=2.0)
-                    initial_text = state.get("text", "")
+                    initial_text = state.text
                     if initial_text:
                         await ws.send_json(
                             {"text": initial_text, "language": _transcriber.language}
