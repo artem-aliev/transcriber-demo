@@ -77,7 +77,7 @@ class Transcriber:
         device: str = "cuda:0",
         context: str = "",
         language: str = "English",
-        gpu_memory_utilization: float = 0.7,
+        gpu_memory_utilization: float = 0.9,
     ) -> None:
         """Load the ASR model via the vLLM backend.
 
@@ -140,7 +140,8 @@ class Transcriber:
         self._model: Any = Qwen3ASRModel.LLM(
             model=model_name,
             gpu_memory_utilization=gpu_memory_utilization,
-            max_inference_batch_size=128,
+            max_model_len=16000,
+            max_inference_batch_size=8,
             max_new_tokens=4096,
         )
 
