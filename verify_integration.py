@@ -337,6 +337,7 @@ def static_checks() -> None:
     check("Srv: TranscriberCPU import", grep("from transcriber_cpu import", "server.py"), "")
     check("Srv: --cpu CLI arg", grep("--cpu", "server.py"), "")
     check("Srv: cpu_mode in /health", grep("cpu_mode", "server.py"), "")
+    check("Srv: WebSocket frame dispatch", grep('"text" in frame', "server.py"), "")
 
     # ── Edge cases ────────────────────────────────────────────────────
     check("Edge: pause guard (skip audio)", grep("Audio frame skipped", "server.py"), "")
