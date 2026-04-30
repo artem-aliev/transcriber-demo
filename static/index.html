@@ -98,6 +98,64 @@
   .status-paused      { background: #fff3cd; color: #856404; }
   .status-stopped     { background: #e8e4dc; color: #6b6b7b; }
 
+  /* Signal-level meter */
+  .signal-meter-wrap {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    margin-bottom: 0.75rem;
+    font-size: 0.75rem;
+    color: #6b6b7b;
+  }
+  .signal-meter {
+    flex: 1;
+    height: 6px;
+    background: #e8e4dc;
+    border-radius: 3px;
+    overflow: hidden;
+    position: relative;
+  }
+  .signal-fill {
+    height: 100%;
+    width: 0%;
+    background: #22c55e;
+    border-radius: 3px;
+    transition: width 60ms linear;
+  }
+  .signal-fill.hot { background: #f59e0b; }
+  .signal-fill.speaking { background: #3b82f6; }
+  .signal-threshold-marker {
+    position: absolute;
+    top: 0;
+    width: 1.5px;
+    height: 100%;
+    background: #ca8a04;
+    opacity: 0.7;
+  }
+  .signal-value {
+    min-width: 3.2rem;
+    text-align: right;
+    font-variant-numeric: tabular-nums;
+  }
+
+  /* Processing pulse indicator */
+  .pulse {
+    display: inline-block;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    margin-right: 0.4rem;
+    vertical-align: middle;
+    transition: background 0.3s ease;
+  }
+  .pulse-listening { background: #22c55e; animation: pulse-dot 1.2s ease-in-out infinite; }
+  .pulse-waiting   { background: #f59e0b; animation: pulse-dot 0.6s ease-in-out infinite; }
+  .pulse-idle      { background: #d1d5db; }
+  @keyframes pulse-dot {
+    0%, 100% { opacity: 1; transform: scale(1); }
+    50%      { opacity: 0.4; transform: scale(1.6); }
+  }
+
   /* Transcript */
   .transcript-box {
     width: 100%;
@@ -116,6 +174,11 @@
     word-wrap: break-word;
     color: #2c2c2c;
     box-shadow: 0 1px 3px rgba(0,0,0,0.06);
+    outline: none;
+  }
+  .transcript-box[contenteditable="true"]:focus {
+    border-color: #6366f1;
+    box-shadow: 0 1px 3px rgba(99,102,241,0.15);
   }
   .transcript-box:empty::before {
     content: "Transcript will appear here…";
@@ -161,6 +224,32 @@
     margin-right: 0.35rem;
   }
   @keyframes spin { to { transform: rotate(360deg); } }
+
+  /* ── Mobile responsive ─────────────────────────────────────────────── */
+  @media (max-width: 600px) {
+    body {
+      padding: 1rem 0.5rem;
+    }
+    h1 {
+      font-size: 1.2rem;
+    }
+    .controls {
+      gap: 0.4rem;
+    }
+    button {
+      padding: 0.5rem 1rem;
+      font-size: 0.85rem;
+    }
+    .transcript-box {
+      max-height: calc(100vh - 280px);
+      padding: 0.75rem 1rem;
+      font-size: 1rem;
+      border-radius: 6px;
+    }
+    .transcript-box:empty::before {
+      font-size: 0.9rem;
+    }
+  }
 </style>
 </head>
 <body>
@@ -174,13 +263,21 @@
   <button id="btnPause" class="btn-pause" disabled>&#9208; Pause</button>
   <button id="btnResume" class="btn-resume" disabled>&#9654; Resume</button>
   <button id="btnSave" class="btn-save" disabled>&#128190; Save</button>
+  <button id="btnCopy" class="btn-save" disabled>&#128203; Copy</button>
   <input type="file" id="fileUpload" accept=".pptx,.docx,.txt" style="display:none">
   <button id="btnUpload" class="btn-upload">&#128206; Upload Context</button>
 </div>
 
 <div id="status" class="status status-disconnected">Disconnected</div>
+<div class="signal-meter-wrap">
+  <div class="signal-meter" id="signalMeter">
+    <div class="signal-fill" id="signalFill"></div>
+    <div class="signal-threshold-marker" id="signalThreshold" style="left:12%"></div>
+  </div>
+  <span class="signal-value" id="signalValue">--</span>
+</div>
 <div id="transcript" class="transcript-box"></div>
-<div id="stats" class="stats"></div>
+<div id="stats" class="stats"><span id="pulseDot" class="pulse pulse-idle"></span></div>
 <div id="errorBanner" class="error-banner"></div>
 
 <script>
@@ -193,12 +290,17 @@
   const btnPause   = document.getElementById("btnPause");
   const btnResume  = document.getElementById("btnResume");
   const btnSave    = document.getElementById("btnSave");
+  const btnCopy    = document.getElementById("btnCopy");
   const btnUpload  = document.getElementById("btnUpload");
   const fileUpload = document.getElementById("fileUpload");
   const statusEl   = document.getElementById("status");
   const transcriptEl = document.getElementById("transcript");
   const statsEl      = document.getElementById("stats");
+  const pulseDot     = document.getElementById("pulseDot");
   const errorBanner  = document.getElementById("errorBanner");
+  const signalMeter  = document.getElementById("signalMeter");
+  const signalFill   = document.getElementById("signalFill");
+  const signalValue  = document.getElementById("signalValue");
 
   // ── State ──────────────────────────────────────────────────────────────
   let audioCtx      = null;
@@ -216,7 +318,7 @@
 
   /** Silence detection constants. */
   const SILENCE_RMS_THRESHOLD = 0.006;
-  const SILENCE_GAP_SAMPLES = 12000;   // ~750ms @ 16kHz
+  const SILENCE_GAP_SAMPLES = 3200;    // ~200ms @ 16kHz (was 12000=750ms)
   const MAX_PHRASE_SAMPLES   = 320000; // 20s max
 
   /** Native mic sample rate (filled when AudioContext is created). */
@@ -264,6 +366,19 @@
     errorBanner.classList.remove("visible");
   }
 
+  function updateSignalDisplay(energy) {
+    var maxEnergy = 0.05;
+    var pct = Math.min(100, (energy / maxEnergy) * 100);
+    signalFill.style.width = pct + "%";
+    signalFill.className = "signal-fill" +
+      (energy >= SILENCE_RMS_THRESHOLD ? (pct > 50 ? " hot" : " speaking") : "");
+    signalValue.textContent = (energy * 1000).toFixed(2) + " mV";
+  }
+
+  function setPulse(state) {
+    pulseDot.className = "pulse pulse-" + state;
+  }
+
   function disableStart(disabled) {
     btnStart.disabled = disabled;
   }
@@ -284,6 +399,10 @@
     btnSave.disabled = disabled;
   }
 
+  function disableCopy(disabled) {
+    btnCopy.disabled = disabled;
+  }
+
   function appendTranscript(text) {
     transcriptEl.textContent = text;
     // Auto-scroll to bottom
@@ -293,33 +412,58 @@
   // ── Transcript accumulation ────────────────────────────────────────────
   /** Completed segment texts (one per pause/stop). */
   let transcriptSegments = [];
+  /** Wall-clock timestamp (seconds since epoch) when the session began. */
+  let sessionStartTime = null;
   /** Current live streaming partial from the ASR. */
   let currentPartial = "";
 
   function updateTranscriptDisplay() {
+    var el = transcriptEl;
+    var wasAtBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 50;
+
     var parts = [];
     for (var i = 0; i < transcriptSegments.length; i++) {
-      var t = transcriptSegments[i].trim();
-      if (t) parts.push(t);
+      var seg = transcriptSegments[i];
+      var t = (typeof seg === "string" ? seg : seg.text || "").trim();
+      if (!t) continue;
+      var sp = seg.speaker || "Speaker";
+      var conf = seg.confidence || 0.9;
+      var opacity = Math.max(0.55, conf);
+      parts.push(
+        '<span style="opacity:' + opacity.toFixed(2) + '">' +
+        '<strong>' + escapeHtml(sp) + ':</strong> ' + escapeHtml(t) +
+        '</span>'
+      );
     }
     var cp = currentPartial.trim();
-    if (cp) parts.push(cp);
-    transcriptEl.textContent = parts.join("\n\n");
-    transcriptEl.scrollTop = transcriptEl.scrollHeight;
+    if (cp) parts.push('<em>' + escapeHtml(cp) + '</em>');
+    el.innerHTML = parts.join("<br><br>");
+
+    // Only auto-scroll if user was already at the bottom
+    if (wasAtBottom) {
+      el.scrollTop = el.scrollHeight;
+    }
+  }
+
+  function escapeHtml(text) {
+    var div = document.createElement("div");
+    div.textContent = text;
+    return div.innerHTML;
   }
 
   /** Called on each streaming partial update from the server. */
   function setPartial(text) {
     currentPartial = text || "";
+    if (text && streamingActive) setPulse("listening");
     updateTranscriptDisplay();
   }
 
   /** Called on pause / stop — saves current partial as a completed segment. */
-  function commitSegment(text) {
+  function commitSegment(text, speaker) {
     var t = (text || currentPartial || "").trim();
     if (t) {
-      transcriptSegments.push(t);
-      console.log("[transcriber] Segment committed (" + t.length + " chars) — total segments: " + transcriptSegments.length);
+      transcriptSegments.push({text: t, time: Date.now() / 1000, speaker: speaker || "Speaker", confidence: 0.9});
+      console.log("[transcriber] Segment committed (" + t.length + " chars, speaker=" + (speaker || "?") + ") — total segments: " + transcriptSegments.length);
     }
     currentPartial = "";
     updateTranscriptDisplay();
@@ -329,6 +473,7 @@
   function resetTranscript() {
     transcriptSegments = [];
     currentPartial = "";
+    sessionStartTime = null;
     updateTranscriptDisplay();
   }
 
@@ -371,7 +516,7 @@
           disableResume(false);
           statsEl.textContent = "paused · " + chunksSent + " chunk" + (chunksSent !== 1 ? "s" : "") + " sent";
           if (msg.text != null) {
-            commitSegment(msg.text);
+            commitSegment(msg.text, msg.speaker);
           }
           return;
         }
@@ -394,8 +539,9 @@
           disableResume(true);
           disableStop(true);
           disableSave(false);
+          disableCopy(false);
           disableStart(false);
-          commitSegment(msg.text || currentPartial);
+          commitSegment(msg.text || currentPartial, msg.speaker);
           if (msg.chunks != null) {
             showStats("stopped", msg.chunks, msg.segments);
           }
@@ -491,6 +637,9 @@
     sampleBuffer = [];
     phraseBuffer = [];
     silenceSamples = 0;
+    signalFill.style.width = "0%";
+    signalFill.className = "signal-fill";
+    signalValue.textContent = "--";
     speaking = false;
   }
 
@@ -552,6 +701,7 @@
       ws.send(chunk.buffer);
       chunksSent++;
       speechSamplesSent += total;
+      setPulse("waiting");
       var dur = (speechSamplesSent / TARGET_SR).toFixed(1);
       statsEl.textContent = chunksSent + " chunk" + (chunksSent !== 1 ? "s" : "") + " · ~" + dur + "s speech sent";
       console.log("[transcriber] Sent phrase #" + chunksSent + ": " + total + " samples (" + (total / TARGET_SR).toFixed(2) + "s)");
@@ -577,11 +727,13 @@
     var inputData = event.inputBuffer.getChannelData(0);
     var resampled = resample(inputData, nativeSampleRate, TARGET_SR);
 
+    var energy = rms(resampled);
+    updateSignalDisplay(energy);
+
     if (paused) return;  // drop audio while paused
 
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
 
-    var energy = rms(resampled);
     var isSpeech = energy >= SILENCE_RMS_THRESHOLD;
 
     if (isSpeech) {
@@ -691,12 +843,15 @@
     silenceSamples = 0;
     speaking = false;
     resetTranscript();
+    setPulse("listening");
+    sessionStartTime = Date.now() / 1000;
     statsEl.textContent = "";
     disableStart(true);
     disableStop(false);
     disablePause(false);
     disableResume(true);
     disableSave(true);
+    disableCopy(true);
     console.log("[transcriber] Capture started — silence detection active. Pause/Upload enabled.");
   }
 
@@ -716,6 +871,7 @@
     streamingActive = false;
     paused = true;
     stopRequested = sendStop;
+    setPulse("idle");
 
     // Flush any remaining speech before sending stop
     flushPendingPhrase();
@@ -749,6 +905,7 @@
     // Flush current phrase before pausing
     flushPendingPhrase();
     paused = true;
+    setPulse("idle");
     console.log("[transcriber] Sending pause control message…");
     ws.send(JSON.stringify({action: "pause"}));
     disablePause(true);
@@ -763,6 +920,7 @@
       return;
     }
     paused = false;
+    setPulse("listening");
     console.log("[transcriber] Sending resume control message…");
     ws.send(JSON.stringify({action: "resume"}));
     disablePause(false);
@@ -770,31 +928,72 @@
     statsEl.textContent = chunksSent + " chunk" + (chunksSent !== 1 ? "s" : "") + " · recording…";
   }
 
-  /** Fetch the timestamped markdown transcript and trigger a browser download. */
+  /** Generate a timestamped markdown transcript and trigger a browser download. */
   function saveTranscript() {
-    console.log("[transcriber] Fetching transcript export…");
-    fetch("/export")
-      .then(function (res) {
-        if (!res.ok) {
-          throw new Error("Export failed — server returned " + res.status);
-        }
-        return res.blob();
-      })
-      .then(function (blob) {
-        const url = URL.createObjectURL(blob);
-        const a = document.createElement("a");
-        a.href = url;
-        a.download = "transcript.md";
-        document.body.appendChild(a);
-        a.click();
-        document.body.removeChild(a);
-        URL.revokeObjectURL(url);
-        console.log("[transcriber] Transcript saved as transcript.md");
-      })
-      .catch(function (err) {
-        console.error("[transcriber] Save failed:", err);
-        showError("Failed to save transcript: " + err.message);
-      });
+    console.log("[transcriber] Generating transcript export…");
+
+    var now = new Date();
+    var lines = [];
+    lines.push("# Meeting Transcript");
+    lines.push("");
+    lines.push("**Date:** " + now.toISOString());
+    lines.push("**Language:** English");
+    lines.push("");
+
+    if (transcriptSegments.length > 0) {
+      lines.push("---");
+      lines.push("");
+
+      var baseTime = sessionStartTime;
+
+      for (var i = 0; i < transcriptSegments.length; i++) {
+        var seg = transcriptSegments[i];
+        var segText = (typeof seg === "string" ? seg : seg.text || "").trim();
+        if (!segText) continue;
+        var segTime = (typeof seg === "string") ? 0 : (seg.time || 0);
+        var segSpeaker = seg.speaker || "Speaker";
+
+        var elapsed = (baseTime != null) ? (segTime - baseTime) : 0;
+
+        var hours = Math.floor(elapsed / 3600);
+        var minutes = Math.floor((elapsed % 3600) / 60);
+        var seconds = Math.floor(elapsed % 60);
+        var ts = (hours < 10 ? "0" : "") + hours + ":" +
+                 (minutes < 10 ? "0" : "") + minutes + ":" +
+                 (seconds < 10 ? "0" : "") + seconds;
+
+        lines.push("[" + ts + "] **" + segSpeaker + ":** " + segText);
+        lines.push("");
+      }
+    }
+
+    var md = lines.join("\n");
+    var blob = new Blob([md], {type: "text/markdown; charset=utf-8"});
+    var url = URL.createObjectURL(blob);
+    var a = document.createElement("a");
+    a.href = url;
+
+    var dateStr = now.getFullYear() + "-" +
+      (now.getMonth() < 9 ? "0" : "") + (now.getMonth() + 1) + "-" +
+      (now.getDate() < 10 ? "0" : "") + now.getDate();
+    a.download = "transcript-" + dateStr + ".md";
+
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+
+    console.log("[transcriber] Transcript saved as " + a.download);
+  }
+
+  function copyTranscript() {
+    var text = transcriptEl.textContent.trim();
+    if (!text) return;
+    navigator.clipboard.writeText(text).then(function () {
+      showUploadConfirm("Copied to clipboard!");
+    }).catch(function () {
+      showError("Failed to copy to clipboard.");
+    });
   }
 
   /** Trigger the hidden file input for document upload. */
@@ -865,7 +1064,30 @@
   btnPause.addEventListener("click", pauseCapture);
   btnResume.addEventListener("click", resumeCapture);
   btnSave.addEventListener("click", saveTranscript);
+  btnCopy.addEventListener("click", copyTranscript);
   btnUpload.addEventListener("click", uploadFile);
+
+  // ── Keyboard shortcuts ─────────────────────────────────────────────────
+  document.addEventListener("keydown", function (e) {
+    // Ignore shortcuts when typing in text fields
+    if (e.target.tagName === "INPUT" || e.target.tagName === "TEXTAREA" ||
+        e.target.isContentEditable) return;
+
+    if (e.code === "Space") {
+      e.preventDefault();
+      if (streamingActive && !paused) {
+        pauseCapture();
+      } else if (streamingActive && paused) {
+        resumeCapture();
+      }
+    } else if (e.code === "Escape") {
+      e.preventDefault();
+      if (streamingActive) stopCapture(true);
+    } else if ((e.ctrlKey || e.metaKey) && e.code === "KeyS") {
+      e.preventDefault();
+      saveTranscript();
+    }
+  });
 
   // ── Initial state ──────────────────────────────────────────────────────
   setStatus("disconnected", "Disconnected");
@@ -873,6 +1095,7 @@
   disablePause(true);
   disableResume(true);
   disableSave(true);
+  disableCopy(true);
 
   console.log("[transcriber] Frontend loaded. Ready.");
 })();

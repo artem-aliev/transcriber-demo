@@ -24,6 +24,8 @@ from __future__ import annotations
 
 import logging
 import os
+import pty
+import select
 import shutil
 import subprocess
 import sys
@@ -62,6 +64,7 @@ class _StreamState:
 
     process: subprocess.Popen
     accumulated: str
+    master_fd: int  # PTY master fd for reading stdout/stderr
     stderr_lines: List[str]
     _lock: Any  # threading.Lock
 
@@ -75,15 +78,20 @@ class _StreamState:
         with self._lock:
             self.accumulated += chunk
 
+    def _replace_text(self, text: str) -> None:
+        with self._lock:
+            self.accumulated = text
+
     def kill(self) -> None:
         try:
             self.process.stdin.close()
         except Exception:
             pass
-        try:
-            self.process.stdout.close()
-        except Exception:
-            pass
+        if hasattr(self, 'master_fd'):
+            try:
+                os.close(self.master_fd)
+            except Exception:
+                pass
         try:
             self.process.kill()
         except Exception:
@@ -247,6 +255,10 @@ class TranscriberCPU:
         chunks are written to the subprocess stdin as raw s16le; partial
         text is read from stdout as it becomes available.
 
+        Uses a PTY (pseudo-terminal) so the binary uses line-buffered
+        stdout instead of fully-buffered pipe mode.  Without a PTY, the
+        binary would only flush its output when stdin is closed.
+
         Args:
             chunk_size_sec: Not used by the CPU backend (the binary uses
                 its own internal 2-second chunking).
@@ -264,20 +276,14 @@ class TranscriberCPU:
             "-d", self._model_dir,
             "--stdin",
             "--stream",
+            "-S", "2",
             "--language", self._language,
-            "--silent",
         ]
         if self._context:
             cmd.extend(["--prompt", self._context])
 
         try:
-            process = subprocess.Popen(
-                cmd,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=False,  # raw bytes for audio
-            )
+            process, master_fd, stderr_lines = _start_pty_process(cmd)
         except FileNotFoundError:
             raise RuntimeError(
                 f"qwen_asr binary not found at {self._binary_path}. "
@@ -287,40 +293,32 @@ class TranscriberCPU:
         state = _StreamState(
             process=process,
             accumulated="",
-            stderr_lines=[],
+            master_fd=master_fd,
+            stderr_lines=stderr_lines,
             _lock=Lock(),
         )
 
-        # Background thread: continuously read stdout into state.accumulated
-        def _read_stdout() -> None:
-            if process.stdout is None:
-                return
+        # Background thread: continuously read PTY master into state.accumulated
+        def _read_pty() -> None:
             try:
-                for chunk_bytes in iter(lambda: process.stdout.read(256), b""):
-                    if not chunk_bytes:
+                while True:
+                    data = os.read(master_fd, 4096)
+                    if not data:
                         break
                     try:
-                        chunk = chunk_bytes.decode("utf-8", errors="replace")
+                        text = data.decode("utf-8", errors="replace")
                     except Exception:
                         continue
-                    state._append_text(chunk)
+                    if _is_status_line(text):
+                        state.stderr_lines.append(text.rstrip())
+                    else:
+                        state._append_text(text)
             except (OSError, ValueError):
                 pass
 
-        Thread(target=_read_stdout, daemon=True).start()
+        Thread(target=_read_pty, daemon=True).start()
 
-        # Background thread: capture stderr for diagnostics
-        def _read_stderr() -> None:
-            if process.stderr is None:
-                return
-            for line_bytes in process.stderr:
-                try:
-                    line = line_bytes.decode("utf-8", errors="replace").rstrip()
-                except Exception:
-                    continue
-                state.stderr_lines.append(line)
-
-        Thread(target=_read_stderr, daemon=True).start()
+        state._total_audio_samples = 0
 
         return state
 
@@ -332,15 +330,16 @@ class TranscriberCPU:
         """Process one audio chunk and return the latest partial text.
 
         Converts float32 audio to s16le, writes to the subprocess stdin.
-        A background thread continuously reads stdout into state.accumulated,
-        so this call just returns whatever text has arrived so far.
+        Auto-flushes every ~6 seconds of accumulated audio by closing the
+        current binary's stdin (forcing output), reading the result, and
+        launching a fresh binary with ``--prompt`` for continuity.
 
         Args:
             audio_chunk: 1-D ``float32`` NumPy array, 16 kHz mono PCM.
             state: The ``_StreamState`` returned by :meth:`start_streaming`.
 
         Returns:
-            The current partial transcription text.
+            The current accumulated transcription text.
         """
         process = state.process
         if process.stdin is None or process.poll() is not None:
@@ -359,7 +358,123 @@ class TranscriberCPU:
         except (BrokenPipeError, OSError):
             logger.warning("qwen_asr subprocess stdin closed.")
 
+        state._total_audio_samples += len(audio_chunk)
+
+        # Auto-flush every ~6 seconds of audio (96000 samples @ 16 kHz)
+        if state._total_audio_samples >= 96000:
+            logger.info("Auto-flushing at %d samples.", state._total_audio_samples)
+            self._flush_and_restart(state)
+
         return state.text
+
+    def _flush_and_restart(self, state: _StreamState) -> None:
+        """Close current binary's stdin, read any remaining output,
+        and launch a new binary instance with the accumulated text
+        as ``--prompt`` for continuity.
+
+        Starts the new binary *before* waiting for the old one, so
+        model-loading latency overlaps with the old binary's shutdown."""
+        old_process = state.process
+        old_master_fd = state.master_fd
+
+        # Close stdin of old binary
+        if old_process.stdin is not None:
+            try:
+                old_process.stdin.close()
+            except Exception:
+                pass
+
+        # Build new prompt from accumulated text (last ~500 chars)
+        flat = state.text.strip()
+        prompt = flat[-500:] if len(flat) > 500 else flat
+        if prompt:
+            self._context = prompt
+
+        # Launch new binary immediately (model loads while old one finishes)
+        new_cmd = [
+            self._binary_path,
+            "-d", self._model_dir,
+            "--stdin",
+            "--stream",
+            "-S", "2",
+            "--language", self._language,
+        ]
+        if self._context:
+            new_cmd.extend(["--prompt", self._context])
+
+        try:
+            new_process, new_master_fd, new_stderr = _start_pty_process(new_cmd)
+        except FileNotFoundError:
+            raise RuntimeError(f"qwen_asr binary not found at {self._binary_path}.")
+
+        # Start new reader thread
+        def _read_pty() -> None:
+            try:
+                while True:
+                    data = os.read(new_master_fd, 4096)
+                    if not data:
+                        break
+                    try:
+                        text = data.decode("utf-8", errors="replace")
+                    except Exception:
+                        continue
+                    if _is_status_line(text):
+                        state.stderr_lines.append(text.rstrip())
+                    else:
+                        state._append_text(text)
+            except (OSError, ValueError):
+                pass
+
+        Thread(target=_read_pty, daemon=True).start()
+
+        # Now read remaining output from OLD binary (non-blocking poll)
+        def _drain_old() -> None:
+            try:
+                deadline = time.time() + 10.0
+                while time.time() < deadline:
+                    ready, _, _ = select.select([old_master_fd], [], [], 0.3)
+                    if not ready:
+                        if old_process.poll() is not None:
+                            break
+                        continue
+                    data = os.read(old_master_fd, 4096)
+                    if not data:
+                        break
+                    try:
+                        text = data.decode("utf-8", errors="replace")
+                    except Exception:
+                        continue
+                    if _is_status_line(text):
+                        state.stderr_lines.append(text.rstrip())
+                    else:
+                        state._append_text(text)
+            except (OSError, ValueError):
+                pass
+            finally:
+                try:
+                    os.close(old_master_fd)
+                except Exception:
+                    pass
+                try:
+                    old_process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    try:
+                        old_process.kill()
+                    except Exception:
+                        pass
+
+        Thread(target=_drain_old, daemon=True).start()
+
+        # Log any stderr from old binary (last lines we collected)
+        for line in state.stderr_lines[-5:]:
+            if "error" in line.lower() or "fail" in line.lower():
+                logger.warning("qwen_asr stderr: %s", line)
+
+        # Update state to point at the new binary
+        state.process = new_process
+        state.master_fd = new_master_fd
+        state.stderr_lines = new_stderr
+        state._total_audio_samples = 0
 
     def finish_streaming(self, state: _StreamState) -> TranscriptionResult:
         """Finalise a streaming session and return the complete transcription.
@@ -386,14 +501,31 @@ class TranscriberCPU:
 
         t_start = time.perf_counter()
 
-        # Read remaining stdout
-        if process.stdout is not None:
-            try:
-                remaining = process.stdout.read()
-                if remaining:
-                    state._append_text(remaining.decode("utf-8", errors="replace"))
-            except Exception:
-                pass
+        # Read remaining output from PTY master
+        try:
+            while True:
+                ready, _, _ = select.select([state.master_fd], [], [], 1.0)
+                if not ready:
+                    break
+                data = os.read(state.master_fd, 4096)
+                if not data:
+                    break
+                try:
+                    text = data.decode("utf-8", errors="replace")
+                except Exception:
+                    continue
+                if _is_status_line(text):
+                    state.stderr_lines.append(text.rstrip())
+                else:
+                    state._append_text(text)
+        except (OSError, ValueError):
+            pass
+
+        # Close PTY master
+        try:
+            os.close(state.master_fd)
+        except Exception:
+            pass
 
         # Wait for process to exit
         try:
@@ -412,11 +544,63 @@ class TranscriberCPU:
         )
 
         # Log any stderr warnings
-        for line in state.stderr_lines:
+        for line in state.stderr_lines[-10:]:
             if "error" in line.lower() or "fail" in line.lower():
                 logger.warning("qwen_asr stderr: %s", line)
 
         return TranscriptionResult(text=text, language=self._language)
+
+
+# ── PTY subprocess helper ────────────────────────────────────────────────────
+
+
+def _is_status_line(text: str) -> bool:
+    """Return True if *text* is a status/diagnostic line, not transcription."""
+    lower = text.strip().lower()
+    if not lower:
+        return True
+    if "\x1b[" in text:
+        return True
+    if lower.startswith("loading"):
+        return True
+    if lower.startswith("detected:"):
+        return True
+    if lower.startswith("model loaded"):
+        return True
+    if lower.startswith("inference:") or lower.startswith("audio:") or lower.startswith("exit:"):
+        return True
+    if lower.startswith("qwen_mel_spectrogram") or lower.startswith("qwen3-asr"):
+        return True
+    if lower.startswith("---") or lower.startswith("***"):
+        return True
+    if "transcription failed" in lower:
+        return True
+    return False
+
+
+def _start_pty_process(cmd: list) -> tuple:
+    """Launch a subprocess with a PTY for stdout/stderr.
+
+    Returns (process, master_fd, stderr_lines_list).
+    """
+    master_fd, slave_fd = pty.openpty()
+
+    try:
+        process = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=slave_fd,
+            stderr=slave_fd,
+            preexec_fn=os.setsid,
+        )
+    except Exception:
+        os.close(master_fd)
+        os.close(slave_fd)
+        raise
+
+    os.close(slave_fd)
+
+    return process, master_fd, []
 
 
 # ── Module-level convenience ─────────────────────────────────────────────────

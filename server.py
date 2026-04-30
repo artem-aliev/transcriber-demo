@@ -48,6 +48,15 @@ except ImportError:
 
 from transcriber_cpu import TranscriberCPU
 
+# ── Speaker diarization ─────────────────────────────────────────────────
+from diarizer import SpeakerTracker, create_diarizer
+
+_diarizer_enabled: bool = os.environ.get("TRANSCRIBER_DIARIZE", "1") != "0"
+"""Set to ``False`` to disable speaker diarization entirely."""
+_diarizer_mode: str = os.environ.get("TRANSCRIBER_DIARIZE_MODE", "gpu")
+"""Diarizer backend: ``"cpu"`` (resemblyzer) or ``"gpu"`` (pyannote)."""
+_diarizer: Optional[SpeakerTracker] = None
+
 # ── Structured logger (same pattern as transcriber.py) ──────────────────────
 logger = logging.getLogger("server")
 logger.setLevel(logging.INFO)
@@ -101,6 +110,9 @@ _session_start_time: Optional[float] = None
 """Wall-clock timestamp (``time.time()``) when the current session began.
 ``None`` when no session is active."""
 
+_segment_audio: List[np.ndarray] = []
+"""Accumulated float32 audio for the current segment (for speaker ID on pause/stop)."""
+
 
 # ── Lifespan ────────────────────────────────────────────────────────────────
 
@@ -108,7 +120,7 @@ _session_start_time: Optional[float] = None
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Load the Transcriber model at startup, clean up on shutdown."""
-    global _transcriber, _model_available
+    global _transcriber, _model_available, _diarizer
 
     if _cpu_mode:
         logger.info("Server starting in CPU mode — loading TranscriberCPU…")
@@ -148,9 +160,37 @@ async def lifespan(app: FastAPI):
             )
             _model_available = False
 
+    # ── Init speaker diarizer ──────────────────────────────────────────
+    if _diarizer_enabled:
+        try:
+            _diarizer = create_diarizer(mode=_diarizer_mode)
+            logger.info(
+                "Speaker diarizer initialised (mode=%s, available=%s).",
+                _diarizer_mode,
+                getattr(_diarizer, "available", False),
+            )
+        except Exception as exc:
+            logger.warning("Speaker diarizer init failed: %s", exc)
+            _diarizer = None
+
     yield  # ── Server runs here ──
 
     logger.info("Server shutting down.")
+
+
+def _identify_speaker() -> str:
+    """Run speaker ID on accumulated segment audio, returning the label."""
+    global _segment_audio, _diarizer
+    if not _diarizer or not _segment_audio:
+        return "Speaker"
+    try:
+        full = np.concatenate(_segment_audio)
+        if len(full) < 1600:  # skip segments < 100ms
+            return "Speaker"
+        result = _diarizer.identify(full)
+        return result.speaker
+    except Exception:
+        return "Speaker"
 
 
 # ── FastAPI app ─────────────────────────────────────────────────────────────
@@ -225,7 +265,9 @@ async def websocket_transcribe(ws: WebSocket) -> None:
 
     try:
         # ── Start streaming ──────────────────────────────────────────────
-        state = _transcriber.start_streaming(chunk_size_sec=2.0)
+        state = _transcriber.start_streaming(chunk_size_sec=0.5)
+        # Clear segment audio accumulator for new session
+        _segment_audio.clear()
         # vLLM's init_streaming_state returns an ASRStreamingState object
         # with .text and .language attributes.
         initial_text = state.text
@@ -256,16 +298,19 @@ async def websocket_transcribe(ws: WebSocket) -> None:
                 if action == "pause":
                     if state is not None and not _session_paused:
                         result = _transcriber.finish_streaming(state)
+                        speaker = _identify_speaker()
                         _session_transcript.append(
-                            {"text": result.text, "time": time.time()}
+                            {"text": result.text, "time": time.time(), "speaker": speaker}
                         )
+                        _segment_audio.clear()
                         state = None
                     _session_paused = True
                     segment_text = (
                         _session_transcript[-1]["text"] if _session_transcript else ""
                     )
                     await ws.send_json(
-                        {"status": "paused", "text": segment_text}
+                        {"status": "paused", "text": segment_text,
+                         "speaker": _session_transcript[-1].get("speaker", "Speaker") if _session_transcript else "Speaker"}
                     )
                     logger.info(
                         "Pause: session paused — %d segments accumulated.",
@@ -274,7 +319,8 @@ async def websocket_transcribe(ws: WebSocket) -> None:
 
                 # ── "resume": start a new ASR streaming segment ─────────
                 elif action == "resume":
-                    state = _transcriber.start_streaming(chunk_size_sec=2.0)
+                    _segment_audio.clear()
+                    state = _transcriber.start_streaming(chunk_size_sec=0.5)
                     initial_text = state.text
                     if initial_text:
                         await ws.send_json(
@@ -290,9 +336,11 @@ async def websocket_transcribe(ws: WebSocket) -> None:
                     if state is not None:
                         result = _transcriber.finish_streaming(state)
                         final_text = result.text
+                        speaker = _identify_speaker()
                         _session_transcript.append(
-                            {"text": result.text, "time": time.time()}
+                            {"text": result.text, "time": time.time(), "speaker": speaker}
                         )
+                        _segment_audio.clear()
                         state = None
                         await ws.send_json(
                             {"text": result.text, "language": _transcriber.language}
@@ -304,6 +352,7 @@ async def websocket_transcribe(ws: WebSocket) -> None:
                         "text": final_text,
                         "chunks": chunk_count,
                         "segments": len(_session_transcript),
+                        "speaker": _session_transcript[-1].get("speaker", "Speaker") if _session_transcript else "Speaker",
                     })
                     logger.info(
                         "Stop: session stopped — %d segments accumulated.",
@@ -383,6 +432,7 @@ async def websocket_transcribe(ws: WebSocket) -> None:
             # Process the chunk through the Transcriber
             try:
                 text = _transcriber.stream_chunk(audio_chunk, state)
+                _segment_audio.append(audio_chunk.copy())  # accumulate for diarization
             except Exception:
                 logger.error(
                     "Error processing audio chunk %d:\n%s",
@@ -424,9 +474,11 @@ async def websocket_transcribe(ws: WebSocket) -> None:
                 total_text_chars = len(result.text)
                 # Save final segment if session was active
                 if _session_active:
+                    speaker = _identify_speaker()
                     _session_transcript.append(
-                        {"text": result.text, "time": time.time()}
+                        {"text": result.text, "time": time.time(), "speaker": speaker}
                     )
+                    _segment_audio.clear()
                 # Send final text if it differs from last partial
                 try:
                     await ws.send_json(
@@ -452,6 +504,11 @@ async def websocket_transcribe(ws: WebSocket) -> None:
             chunk_count,
             total_text_chars,
         )
+
+        try:
+            await ws.close(code=1000)
+        except Exception:
+            pass
 
 
 # ── Health check ────────────────────────────────────────────────────────────
@@ -653,6 +710,7 @@ async def export_transcript() -> Response:
         for segment in _session_transcript:
             seg_text = segment.get("text", "")
             seg_time = segment.get("time", 0.0)
+            seg_speaker = segment.get("speaker", "")
 
             # If we have a base time, use it; otherwise treat seg_time as
             # already relative.
@@ -667,7 +725,8 @@ async def export_transcript() -> Response:
             seconds = int(elapsed % 60)
             timestamp = f"{hours:02d}:{minutes:02d}:{seconds:02d}"
 
-            lines.append(f"[{timestamp}] {seg_text}")
+            prefix = f"**{seg_speaker}:** " if seg_speaker else ""
+            lines.append(f"[{timestamp}] {prefix}{seg_text}")
             lines.append("")
 
     # ── Build filename ───────────────────────────────────────────────────
@@ -712,6 +771,24 @@ if __name__ == "__main__":
         help="Path to qwen_asr binary (default: ./qwen-asr/qwen_asr).",
     )
     parser.add_argument(
+        "--diarize",
+        action="store_true",
+        default=True,
+        help="Enable speaker diarization (default: enabled).",
+    )
+    parser.add_argument(
+        "--no-diarize",
+        action="store_false",
+        dest="diarize",
+        help="Disable speaker diarization.",
+    )
+    parser.add_argument(
+        "--diarize-mode",
+        default=None,
+        help="Diarizer backend: 'cpu' (resemblyzer) or 'gpu' (pyannote). "
+             "Default: 'cpu' when --cpu, 'gpu' otherwise.",
+    )
+    parser.add_argument(
         "--host",
         default="0.0.0.0",
         help="Bind address (default: 0.0.0.0).",
@@ -729,6 +806,12 @@ if __name__ == "__main__":
         os.environ["TRANSCRIBER_CPU_MODEL_DIR"] = args.cpu_model_dir
         os.environ["TRANSCRIBER_CPU_BINARY"] = args.cpu_binary_path
         print(f"CPU mode: model={args.cpu_model_dir}, binary={args.cpu_binary_path}")
+
+    # Diarizer settings — use env vars so uvicorn's re-import picks them up
+    diarize_mode = args.diarize_mode or ("cpu" if args.cpu else "gpu")
+    os.environ["TRANSCRIBER_DIARIZE"] = "1" if args.diarize else "0"
+    os.environ["TRANSCRIBER_DIARIZE_MODE"] = diarize_mode
+    print(f"Diarizer: enabled={args.diarize}, mode={diarize_mode}")
 
     uvicorn.run(
         "server:app",
